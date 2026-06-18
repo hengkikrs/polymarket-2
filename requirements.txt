@@ -1,0 +1,4 @@
+aiohttp>=3.13
+py-clob-client-v2
+python-dotenv>=1.2
+openpyxl>=3.1

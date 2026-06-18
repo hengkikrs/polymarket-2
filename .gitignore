@@ -1,0 +1,48 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Runtime state and trading history (live in <repo>/runtime_data/ and <repo>/logs/)
+runtime_data/
+logs/
+bot.log
+*.log
+bot_instance.lock
+bot_control.json
+emergency_stop.json
+state.json
+balance.json
+daily_pnl.json
+cumulative_stats.json
+trades.json
+trigger_expectancy.json
+snapshots.json
+risk_events.json
+kelly_state.json
+*.bak-*
+.state_*.tmp
+.trades_*.tmp
+.*.tmp
+
+# Local caches and tooling output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.rtk/
+.vscode/
+.claude/
+
+# Local databases / reports
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.xlsx
+*.pdf

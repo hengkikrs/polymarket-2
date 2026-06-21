@@ -1533,7 +1533,7 @@ async function loadCalendar(force=false){
 }
 function shiftMonth(n){calDate.setMonth(calDate.getMonth()+n);loadCalendar()}
 
-setInterval(refresh,1000); refresh(); loadCalendar(); keepScreenAwake();
+setInterval(refresh,200); refresh(); loadCalendar(); keepScreenAwake();
 </script></body></html>"""
     return web.Response(text=html, content_type="text/html")
 

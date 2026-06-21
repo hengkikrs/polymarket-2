@@ -1459,8 +1459,9 @@ function renderPnlSummary(s){
  const totalPnl = p.total_pnl ?? s.total_pnl ?? 0;
  const totalCap = p.total_capital || 1000;
  const profitPct = totalCap > 0 ? (totalPnl / totalCap * 100) : 0;
+ const currentModal = totalCap + totalPnl;
  const items=[
-  ['Modal saat ini',money(p.current_capital??s.balance),'mono'],
+  ['Modal saat ini',money(currentModal),'mono'],
   ['Total modal',money(totalCap),'mono'],
   ['Total PnL',money(totalPnl),'mono '+clsBy(totalPnl)],
   ['Profit (%)',pct(profitPct),'mono '+clsBy(profitPct)],

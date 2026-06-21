@@ -56,7 +56,6 @@ class EndWindowConfig:
     live_trade_usd: float = 1.0
     min_trade_usd: float = 5.0
     max_trades_per_window: int = 9
-    reversal_trade_usd: float = 100.0
     max_spread: float = 1.0
     force_trade: bool = True
     force_retry_attempts: int = 8
@@ -64,6 +63,11 @@ class EndWindowConfig:
     force_final_price_cap: float = 0.99
     min_reasonable_price: float = 0.50
     min_side_price_edge: float = 0.03
+    # FIX #3: fast-lane open. Saat ask sisi unggul >= fast_open_price dan
+    # orderbook/spread lolos, eksekusi segera tanpa menunggu cadence layer.
+    fast_open_enabled: bool = False
+    fast_open_price: float = 0.90
+    fast_open_max_price: float = 0.99
     layers: tuple[EndWindowLayer, ...] = (
         EndWindowLayer("T1", 25.0, 20.0, 70.0, 0.50, 0.90),
         EndWindowLayer("T2", 20.0, 15.0, 55.0, 0.50, 0.92),
@@ -81,7 +85,6 @@ class EndWindowConfig:
             live_trade_usd=_f("END_WINDOW_LIVE_TRADE_USD", 1.0),
             min_trade_usd=_f("END_WINDOW_MIN_TRADE_USD", 5.0),
             max_trades_per_window=_i("END_WINDOW_MAX_TRADES_PER_WINDOW", 9),
-            reversal_trade_usd=_f("END_WINDOW_REVERSAL_TRADE_USD", 100.0),
             max_spread=_f("END_WINDOW_MAX_SPREAD", 1.0),
             force_trade=_b("END_WINDOW_FORCE_TRADE", "true"),
             force_retry_attempts=_i("END_WINDOW_FORCE_RETRY_ATTEMPTS", 8),
@@ -89,6 +92,9 @@ class EndWindowConfig:
             force_final_price_cap=_f("END_WINDOW_FORCE_FINAL_PRICE_CAP", 0.98),
             min_reasonable_price=_f("END_WINDOW_MIN_REASONABLE_PRICE", 0.50),
             min_side_price_edge=_f("END_WINDOW_MIN_SIDE_EDGE", 0.03),
+            fast_open_enabled=_b("END_WINDOW_FAST_OPEN_ENABLED", "false"),
+            fast_open_price=_f("END_WINDOW_FAST_OPEN_PRICE", 0.90),
+            fast_open_max_price=_f("END_WINDOW_FAST_OPEN_MAX_PRICE", 0.99),
         )
 
     @classmethod
@@ -111,7 +117,6 @@ class EndWindowConfig:
             live_trade_usd=base.live_trade_usd,
             min_trade_usd=base.min_trade_usd,
             max_trades_per_window=int(getattr(settings, "max_trades_per_window", 9)),
-            reversal_trade_usd=base.reversal_trade_usd,
             max_spread=base.max_spread,
             force_trade=base.force_trade,
             force_retry_attempts=base.force_retry_attempts,
@@ -119,6 +124,9 @@ class EndWindowConfig:
             force_final_price_cap=base.force_final_price_cap,
             min_reasonable_price=base.min_reasonable_price,
             min_side_price_edge=base.min_side_price_edge,
+            fast_open_enabled=base.fast_open_enabled,
+            fast_open_price=base.fast_open_price,
+            fast_open_max_price=base.fast_open_max_price,
             layers=layers,
         )
 

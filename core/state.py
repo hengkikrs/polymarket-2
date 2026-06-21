@@ -134,6 +134,7 @@ class BotSettings:
     max_trades_per_window: int   = 9
     trade_amount: float          = 100.0
     max_loss_per_trade: float    = 10.0
+    profit_stop_pct: float       = 100.0
     t1_enabled: bool             = True
     t2_enabled: bool             = True
     t3_enabled: bool             = True
@@ -170,6 +171,12 @@ class BotSettings:
     time4_trade_usd: float       = 100.0
     time5_trade_usd: float       = 100.0
     time6_trade_usd: float       = 100.0
+    time1_min_delta_usd: float   = 3.0
+    time2_min_delta_usd: float   = 3.0
+    time3_min_delta_usd: float   = 3.0
+    time4_min_delta_usd: float   = 3.0
+    time5_min_delta_usd: float   = 3.0
+    time6_min_delta_usd: float   = 3.0
     buy1_enabled: bool           = True
     buy1_trade_usd: float        = 25.0
     buy1_min_price: float        = 0.50
@@ -323,6 +330,7 @@ def update_settings(data: dict) -> BotSettings:
         **{f"time{i}_min_secs_left": (0.0, 299.9) for i in range(1, 7)},
         **{f"time{i}_max_secs_left": (0.1, 300.0) for i in range(1, 7)},
         **{f"time{i}_trade_usd": (1.0, 10000.0) for i in range(1, 7)},
+        **{f"time{i}_min_delta_usd": (0.0, 500.0) for i in range(1, 7)},
         "buy1_trade_usd":        (1.0, 10000.0),
         "buy1_min_price":        (0.01, 0.99),
         "buy1_max_price":        (0.01, 0.99),

@@ -51,10 +51,13 @@ def build_end_window_meta(settings: st.BotSettings) -> dict:
             "name": trigger,
             "time": f"Any time above {getattr(settings, f'time{i}_min_secs_left'):g}s",
             "price": f"exactly {getattr(settings, f'time{i}_price'):.2f}",
-            "req": f"Visible ask liquidity >= ${getattr(settings, f'time{i}_trade_usd'):g}",
+            "req": (
+                f"BTC delta >= ${getattr(settings, f'time{i}_min_delta_usd'):g}; "
+                f"visible ask liquidity >= ${getattr(settings, f'time{i}_trade_usd'):g}"
+            ),
             "risk": "highest",
             "color": colors[trigger],
-            "desc": "Configurable exact-price FOK entry; requires aligned BTC delta >= $3",
+            "desc": "Configurable exact-price FOK entry with aligned BTC delta gate",
         }
     cfg = end_window.EndWindowConfig.from_settings(settings)
     for layer in sorted(cfg.layers, key=lambda item: item.seconds_left_max, reverse=True):

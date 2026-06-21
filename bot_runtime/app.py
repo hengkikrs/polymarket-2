@@ -39,6 +39,11 @@ OFFICIAL_RESOLVE_DELAY_SECS: float = float(os.getenv("END_WINDOW_OFFICIAL_RESOLV
 OFFICIAL_RETRY_INTERVAL_SECS: float = float(os.getenv("END_WINDOW_OFFICIAL_RETRY_INTERVAL_SECS", "2.0"))
 EXCHANGE_PRICE_MAX_AGE_SECS: float = float(os.getenv("EXCHANGE_PRICE_MAX_AGE_SECS", "3.0"))
 CHAINLINK_PRICE_MAX_AGE_SECS: float = float(os.getenv("CHAINLINK_PRICE_MAX_AGE_SECS", "10.0"))
+# FIX #2: re-sync target resmi (priceToBeat) Polymarket selama window.
+TARGET_RESYNC_SECS: float = float(os.getenv("END_WINDOW_TARGET_RESYNC_SECS", "3.0"))
+# Saat target resmi belum terkonfirmasi DAN |btc_now-btc_open| <= ambang ini
+# (near-the-money), bot menahan trade agar tidak salah arah. 0 = nonaktif.
+TARGET_NEAR_STRIKE_USD: float = float(os.getenv("END_WINDOW_TARGET_NEAR_STRIKE_USD", "5.0"))
 
 
 class Bot:
@@ -56,21 +61,29 @@ class Bot:
         self._last_btc_source = ""
         self._last_chainlink_age = 999.0
         self._last_exchange_age = 999.0
+        self._context_inflight = False  # FIX #1: regime analysis off hot path
+        self._target_locked_official = False  # FIX #2: priceToBeat re-sync state
+        self._last_target_resync = 0.0
         self._window_settings: st.BotSettings | None = None
         self._telegram_task: asyncio.Task | None = None
 
-        st.set_trading_enabled(False)
+        # MOCK mode: preserve trading_enabled across restarts so bot
+        # resumes automatically.  LIVE mode: always require explicit
+        # /trading command for safety.
+        if not config.MOCK_MODE:
+            st.set_trading_enabled(False)
         bal = st.load_balance()
         cfg = st.load_settings()
+        _restored_trading = st.get_trading_enabled() if config.MOCK_MODE else False
         self.state = st.BotState(
             started_at=time.time(),
             mock_mode=config.MOCK_MODE,
             balance=float(bal.get("balance", 0.0) or 0.0),
             initial_balance=float(bal.get("initial", 0.0) or 0.0),
             max_trades_per_window=cfg.max_trades_per_window,
-            trading_enabled=False,
-            bot_status="waiting",
-            status="waiting",
+            trading_enabled=_restored_trading,
+            bot_status="scanning" if _restored_trading else "waiting",
+            status="scanning" if _restored_trading else "waiting",
             active_settings=st.asdict(cfg),
         )
         self._sync_stats()
@@ -181,6 +194,90 @@ class Bot:
                 return
             await asyncio.sleep(min(delay, 1.0))
 
+    async def _update_market_context_bg(self, now: float) -> None:
+        """FIX #1: hitung regime/context di executor + background task.
+
+        Tidak di-await oleh tick loop, jadi tidak mempengaruhi latency_ms.
+        Guard ``_context_inflight`` mencegah penumpukan task.
+        """
+        if self._context_inflight:
+            return
+        self._context_inflight = True
+        try:
+            loop = asyncio.get_running_loop()
+            snapshots = await loop.run_in_executor(None, st.load_snapshots)
+            context = await loop.run_in_executor(
+                None, lambda: analyze_market_context(snapshots, now=now)
+            )
+            self.state.current_regime = context["regime"]
+            self.state.regime_reason = context["reason"]
+            self.state.market_context_source = context["source"]
+            self.state.market_context_confidence = context["confidence"]
+            self.state.market_context_coverage_20m = context["coverage_20m"]
+            self.state.delta_10s = context["delta_10s"]
+            self.state.delta_10s_avg_20m = context["avg_signed_delta_10s_20m"]
+            self.state.delta_10s_abs_avg_20m = context["avg_abs_delta_10s_20m"]
+            self.state.delta_10s_abs_p90_20m = context["p90_abs_delta_10s_20m"]
+            self.state.trend_net_move_20m = context["net_move_20m"]
+            self.state.trend_slope_per_min_20m = context["slope_per_min_20m"]
+            self.state.trend_efficiency_20m = context["efficiency_20m"]
+            self.state.saturation_avg_secs_30m = context["saturation_avg_secs_30m"]
+            self.state.saturation_samples_30m = context["saturation_samples_30m"]
+            self.state.locked_avg_secs_30m = context["locked_avg_secs_30m"]
+            self.state.locked_samples_30m = context["locked_samples_30m"]
+            self.state.saturation_completed_windows_30m = context["completed_windows_30m"]
+        except Exception as exc:
+            log.debug("market context bg failed: %s", exc)
+        finally:
+            self._context_inflight = False
+
+    async def _resync_official_target(
+        self,
+        session: aiohttp.ClientSession,
+        market: mkt.BTCMarket,
+        window_ts: int,
+        market_interval: int,
+        btc_open: float,
+    ) -> tuple[float, mkt.BTCMarket]:
+        """FIX #2: adopsi priceToBeat resmi Polymarket saat sudah terbit.
+
+        ``btc_open`` awal bisa berasal dari snapshot Chainlink bot sendiri kalau
+        priceToBeat belum tersedia di awal window. Method ini re-fetch market
+        secara berkala (gated TARGET_RESYNC_SECS) sampai priceToBeat resmi muncul,
+        lalu mengunci ``btc_open`` ke nilai resmi tersebut. Return (btc_open, market).
+        """
+        if self._target_locked_official or market.target_price > 0 and self._target_locked_official:
+            return btc_open, market
+        now = time.time()
+        # Jika btc_open sudah == priceToBeat resmi yang ada di market, kunci.
+        if market.target_price > 0 and abs(float(market.target_price) - float(btc_open)) <= 1e-6:
+            self._target_locked_official = True
+            return btc_open, market
+        if now - self._last_target_resync < TARGET_RESYNC_SECS:
+            return btc_open, market
+        self._last_target_resync = now
+        try:
+            fresh = await asyncio.wait_for(
+                mkt.fetch_market(session, "BTC", interval_secs=market_interval),
+                timeout=PRICE_SOURCE_TIMEOUT_SECS,
+            )
+        except Exception as exc:
+            log.debug("[FIX#2] target re-fetch failed: %s", exc)
+            return btc_open, market
+        if not fresh or int(getattr(fresh, "window_ts", 0) or 0) != int(window_ts):
+            return btc_open, market
+        official = float(getattr(fresh, "target_price", 0.0) or 0.0)
+        if official > 0:
+            if abs(official - float(btc_open)) > 1e-6:
+                log.warning(
+                    "[FIX#2] btc_open re-synced ke priceToBeat resmi: %.2f -> %.2f (drift %.2f)",
+                    float(btc_open), official, official - float(btc_open),
+                )
+            market.target_price = official
+            self._target_locked_official = True
+            return official, market
+        return btc_open, market
+
     async def _btc_now(self, session: aiohttp.ClientSession) -> float:
         cache = get_cache()
         now = time.time()
@@ -199,6 +296,29 @@ class Bot:
             ]
             self._last_exchange_age = min(exchange_ages, default=999.0)
             return float(chainlink)
+            
+        if coinbase and float(coinbase) > 0:
+            self._last_btc_source = "coinbase (fallback)"
+            self._last_chainlink_age = float(source_age("coinbase")) if source_age else 0.0
+            exchange_ages = [
+                float(source_age(name))
+                for name, price in (("coinbase", coinbase), ("gateio", gateio))
+                if price and source_age
+            ]
+            self._last_exchange_age = min(exchange_ages, default=999.0)
+            return float(coinbase)
+            
+        if gateio and float(gateio) > 0:
+            self._last_btc_source = "gateio (fallback)"
+            self._last_chainlink_age = float(source_age("gateio")) if source_age else 0.0
+            exchange_ages = [
+                float(source_age(name))
+                for name, price in (("coinbase", coinbase), ("gateio", gateio))
+                if price and source_age
+            ]
+            self._last_exchange_age = min(exchange_ages, default=999.0)
+            return float(gateio)
+
         self._last_btc_source = "chainlink-unavailable"
         self._last_chainlink_age = float(source_age("chainlink")) if source_age else 999.0
         exchange_ages = [
@@ -428,6 +548,19 @@ class Bot:
         self.state.session_pnl = self._session_pnl
         self._sync_stats()
         self._save(force=True)
+
+        cfg = st.load_settings()
+        window_budget = cfg.trade_amount * cfg.max_trades_per_window
+        profit_limit = window_budget * (cfg.profit_stop_pct / 100.0)
+        
+        if total_pnl >= profit_limit and profit_limit > 0:
+            log.info("Target profit reached for window %d: $%.2f (>= $%.2f). Stopping bot.", window_ts, total_pnl, profit_limit)
+            self.state.trading_enabled = False
+            self.state.status = self.state.bot_status = "waiting"
+            st.set_trading_enabled(False)
+            self._sync_stats()
+            self._save(force=True)
+            asyncio.create_task(tg.send(f"⚠️ **BOT STOPPED**\nTarget profit reached: +${total_pnl:.2f} (>= {cfg.profit_stop_pct}% of budget ${window_budget:.2f})"))
         wins = sum(1 for t in resolved if t.get("won") is True)
         losses = sum(1 for t in resolved if t.get("won") is False)
         log.info(
@@ -583,20 +716,36 @@ class Bot:
                 log.debug("telegram command loop failed: %s", exc)
                 await asyncio.sleep(3.0)
 
+    @staticmethod
+    def _on_bg_task_done(task: asyncio.Task) -> None:
+        """Log unhandled exceptions from background tasks instead of losing them."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            log.error("Background task %s crashed: %s", task.get_name(), exc, exc_info=exc)
+
     async def run(self):
         mode = "MOCK" if config.MOCK_MODE else "LIVE"
         label = "+".join(sorted(enabled_strategies())) or config.STRATEGY_MODE
         log.info("=" * 58)
         log.info("BOT [%s] strategies=%s", mode, label)
         log.info("Dashboard: http://localhost:%s", os.getenv("DASH_PORT", "5004"))
+        if self.state.trading_enabled:
+            log.info("Trading RESTORED from previous session")
+        else:
+            log.info("Trading disabled — send /trading to start")
         log.info("=" * 58)
 
         if not self._apply_safety_gate("startup_safety_block"):
             return
 
         await self._ws_feed.start()
+        for task in self._ws_feed._tasks:
+            task.add_done_callback(self._on_bg_task_done)
         if config.TG_TOKEN and config.TG_CHAT:
             self._telegram_task = asyncio.create_task(self._telegram_command_loop())
+            self._telegram_task.add_done_callback(self._on_bg_task_done)
         try:
             while self.running:
                 if st.get_emergency_stop():
@@ -675,6 +824,10 @@ class Bot:
             btc_open, source, market = recovered
         self.state.market_question = market.question
         self.state.btc_open = btc_open
+        # FIX #2: reset state re-sync target tiap window. Kunci segera hanya jika
+        # btc_open sudah berasal dari priceToBeat resmi Polymarket.
+        self._target_locked_official = source.startswith("Polymarket priceToBeat")
+        self._last_target_resync = 0.0
         log.info(
             "Window %d | closes %s UTC | btc_open=$%.2f (%s) | balance=$%.2f",
             window_ts,
@@ -698,6 +851,12 @@ class Bot:
             await self._resolve_closed_directional_orphans(session, window_ts)
             btc_now = await self._btc_now(session)
             market = await self._refresh_market(session, market, secs_left)
+            # FIX #2: adopsi priceToBeat resmi begitu terbit; kunci btc_open.
+            btc_open, market = await self._resync_official_target(
+                session, market, window_ts, market_interval, btc_open
+            )
+            self.state.btc_open = btc_open
+            target_unconfirmed = not self._target_locked_official
             delta = (
                 float(btc_now or 0.0) - float(btc_open or 0.0)
                 if btc_open > 0
@@ -745,24 +904,9 @@ class Bot:
                     up_spread=market.up_spread,
                     down_spread=market.down_spread,
                 )
-                context = analyze_market_context(st.load_snapshots(), now=now)
-                self.state.current_regime = context["regime"]
-                self.state.regime_reason = context["reason"]
-                self.state.market_context_source = context["source"]
-                self.state.market_context_confidence = context["confidence"]
-                self.state.market_context_coverage_20m = context["coverage_20m"]
-                self.state.delta_10s = context["delta_10s"]
-                self.state.delta_10s_avg_20m = context["avg_signed_delta_10s_20m"]
-                self.state.delta_10s_abs_avg_20m = context["avg_abs_delta_10s_20m"]
-                self.state.delta_10s_abs_p90_20m = context["p90_abs_delta_10s_20m"]
-                self.state.trend_net_move_20m = context["net_move_20m"]
-                self.state.trend_slope_per_min_20m = context["slope_per_min_20m"]
-                self.state.trend_efficiency_20m = context["efficiency_20m"]
-                self.state.saturation_avg_secs_30m = context["saturation_avg_secs_30m"]
-                self.state.saturation_samples_30m = context["saturation_samples_30m"]
-                self.state.locked_avg_secs_30m = context["locked_avg_secs_30m"]
-                self.state.locked_samples_30m = context["locked_samples_30m"]
-                self.state.saturation_completed_windows_30m = context["completed_windows_30m"]
+                # FIX #1: jalankan analisis regime (load snapshots + hitung 20-30m)
+                # di background task agar tidak menggelembungkan latency_ms tick.
+                asyncio.create_task(self._update_market_context_bg(now))
 
             try:
                 buy1_exits = await end_window.try_buy1_exits(
@@ -776,17 +920,34 @@ class Bot:
                     self._save(force=True)
                     if not config.MOCK_MODE:
                         trader.invalidate_live_balance_cache()
-                records = await end_window.try_all_end_window(
-                    market=market,
-                    btc_open=btc_open,
-                    btc_now=btc_now,
-                    secs_elapsed=secs_elapsed,
-                    secs_left=secs_left,
-                    bankroll_usd=st.get_balance(),
-                    session=session,
-                    cfg=strategy_cfg,
-                    settings=cfg,
+                near_strike = (
+                    TARGET_NEAR_STRIKE_USD > 0
+                    and abs(delta) <= TARGET_NEAR_STRIKE_USD
                 )
+                if target_unconfirmed and near_strike:
+                    # FIX #2 (resync_and_guard): target resmi belum terkonfirmasi
+                    # dan harga dekat strike — arah UP/DOWN belum bisa dipercaya.
+                    # Tahan entry baru (exit di atas tetap jalan).
+                    self.state.status = self.state.bot_status = "target_unconfirmed"
+                    if int(now) % 5 == 0:
+                        log.warning(
+                            "[FIX#2] entry ditahan: priceToBeat resmi belum konfirmasi "
+                            "& near-strike (delta=$%.2f <= $%.2f)",
+                            abs(delta), TARGET_NEAR_STRIKE_USD,
+                        )
+                    records = []
+                else:
+                    records = await end_window.try_all_end_window(
+                        market=market,
+                        btc_open=btc_open,
+                        btc_now=btc_now,
+                        secs_elapsed=secs_elapsed,
+                        secs_left=secs_left,
+                        bankroll_usd=st.get_balance(),
+                        session=session,
+                        cfg=strategy_cfg,
+                        settings=cfg,
+                    )
             except Exception as exc:
                 log.warning("[END_WINDOW] dispatcher exception: %s", exc)
                 records = []
@@ -854,6 +1015,10 @@ def main():
     signal.signal(signal.SIGTERM, _stop)
     try:
         asyncio.run(bot.run())
+    except KeyboardInterrupt:
+        log.info("Bot stopped by user (Ctrl+C).")
+    except Exception:
+        log.exception("Bot crashed with unhandled exception")
     finally:
         release_instance_lock()
 

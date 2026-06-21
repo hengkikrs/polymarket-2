@@ -286,6 +286,35 @@ class ProcessManager:
                 pids.append(pid)
         return pids
 
+    def _free_ports(self, ports: list[int]):
+        """Find and terminate any processes holding the specified ports (except ourselves)."""
+        if os.name != "nt":
+            return
+        pids = []
+        try:
+            out = subprocess.check_output(["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) >= 5 and parts[0].upper() in ("TCP", "UDP"):
+                    local_address = parts[1]
+                    try:
+                        port_str = local_address.split(":")[-1]
+                        port = int(port_str)
+                        if port in ports:
+                            pid = int(parts[-1])
+                            if pid > 0 and pid != os.getpid():
+                                pids.append(pid)
+                    except (ValueError, IndexError):
+                        continue
+        except Exception:
+            pass
+
+        for pid in set(pids):
+            self._taskkill(pid, f"blocking port {ports}")
+
     def _cleanup_stale_dev_processes(self):
         """Remove stale bot/dashboard/tracker left by a previous dev run."""
         if os.name != "nt":
@@ -312,15 +341,7 @@ class ProcessManager:
             self._taskkill(pid, "old repo main.py process")
 
         # Dashboard/tracker: free their fixed dev ports before binding.
-        port_cmd = (
-            "Get-NetTCPConnection -LocalPort 5004,5005 -ErrorAction SilentlyContinue "
-            "| Select-Object -ExpandProperty OwningProcess -Unique"
-        )
-        for line in self._powershell_lines(port_cmd):
-            try:
-                self._taskkill(int(line), "old dashboard/tracker port owner")
-            except ValueError:
-                continue
+        self._free_ports([5004, 5005])
 
         time.sleep(0.5)
 
@@ -411,6 +432,12 @@ class ProcessManager:
             for pid in self._python_script_pids(BOT_SCRIPT):
                 if pid != current_pid:
                     self._taskkill(pid, "existing main.py before restart")
+
+        # Clean up ports if we are starting dashboard or tracker to prevent binding errors
+        if module == DASHBOARD_MODULE:
+            self._free_ports([5004])
+        elif module == TRACKER_MODULE:
+            self._free_ports([5005])
 
         time.sleep(0.3)
         if module:

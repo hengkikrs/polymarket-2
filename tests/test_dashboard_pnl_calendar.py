@@ -13,6 +13,7 @@ from web.dashboard import (
     _price_extreme_stats,
     _recent_trades,
     _trade_fire_layer,
+    api_health,
     api_settings_post,
     index,
 )
@@ -186,23 +187,22 @@ def test_recent_trades_labels_arb5_strategy():
     assert _trade_fire_layer(trade) == "ARB5-DOWN"
 
 
-def test_dashboard_exposes_dynamic_market_link_and_reversal_checklist():
+def test_dashboard_exposes_dynamic_market_link():
     settings = _end_window_settings(st.BotSettings())
     html = asyncio.run(index(None)).text
 
     assert settings["market_5m_enabled"] is True
-    assert settings["reversal_max_price"] == 0.40
-    assert settings["reversal_trade_usd"] == 100.0
     assert settings["max_trades_per_window"] == 9
     assert "const TRADE_PAGE_SIZE = 100;" in html
-    assert "ask <= ${num(d.reversalMaxPrice||0.40,2)}" in html
     assert "arb15_price" not in html
     assert "arb5_price" not in html
     assert "BTC 15m" not in html
     assert "Buy when <= (s)" in html
+    assert "Min delta $" in html
     assert settings["time_min_delta_usd"] == 3.0
     assert settings["time1_enabled"] is True
     assert settings["time1_price"] == 0.98
+    assert settings["time1_min_delta_usd"] == 3.0
     assert settings["time2_enabled"] is True
     assert settings["time2_price"] == 0.99
     assert settings["time1_min_secs_left"] == 3.0
@@ -223,7 +223,6 @@ def test_dashboard_exposes_dynamic_market_link_and_reversal_checklist():
     assert "buy1_min_price" in html
     assert "currentMarketLink" in html
     assert "upLiquidity" in html
-    assert "Extreme Price Reversal Research" in html
     assert "Low Price Winner Research" in html
     assert 'id="marketRegime"' in html
     assert 'id="delta10s"' in html
@@ -234,7 +233,6 @@ def test_dashboard_exposes_dynamic_market_link_and_reversal_checklist():
     assert "const timeStates=[1,2,3,4,5,6]" in html
     assert ".sort((a,b)=>a.price-b.price||a.index-b.index)" in html
     assert "const timeEditors=[1,2,3,4,5,6]" in html
-    assert "WAIT REVERSAL" in html
     assert "Market saturated: unavailable side shown as N/A" in html
     assert "navigator.wakeLock.request('screen')" in html
     assert "visibilitychange" in html
@@ -242,8 +240,23 @@ def test_dashboard_exposes_dynamic_market_link_and_reversal_checklist():
     assert "const TRADE_PAGE_SIZE = 100;" in html
     assert "const RESEARCH_PAGE_SIZE = 10" in html
     assert 'id="tradePagination"' in html
-    assert 'id="extremePagination"' in html
     assert 'id="lowWinnerPagination"' in html
+
+
+def test_health_endpoint_exposes_non_secret_runtime_status():
+    with (
+        patch("web.dashboard.st.load_state", return_value={"last_update": 123.0, "current_window": 456}),
+        patch("web.dashboard.st.get_trading_enabled", return_value=True),
+        patch("web.dashboard.st.get_emergency_stop", return_value=False),
+    ):
+        response = asyncio.run(api_health(None))
+
+    data = json.loads(response.text)
+    assert data["ok"] is True
+    assert data["service"] == "poly-v3-dashboard"
+    assert data["trading_enabled"] is True
+    assert data["emergency_stop"] is False
+    assert "POLYMARKET_PRIVATE_KEY" not in response.text
 
 
 def test_market_settings_force_btc_5m_only(tmp_path, monkeypatch):
@@ -301,30 +314,10 @@ def test_price_extreme_stats_counts_each_level_independently():
     with patch("web.dashboard.st.load_price_extremes", return_value=data):
         stats = _price_extreme_stats()
 
-    assert [row["dual_hit_windows"] for row in stats["levels"]] == [1, 1, 0]
-    assert stats["recent_reversals"][0]["first_side"] == "UP"
+    assert len(stats["levels"]) == 3
 
 
-def test_price_extreme_stats_retains_all_events_for_pagination():
-    windows = [
-        {
-            "window_ts": index,
-            "market_slug": f"btc-updown-5m-{index}",
-            "max_up_bid": 0.97,
-            "max_down_bid": 0.97,
-            "hits": {
-                "0.97": {"up_ts": float(index), "down_ts": float(index + 1)},
-                "0.98": {"up_ts": None, "down_ts": None},
-                "0.99": {"up_ts": None, "down_ts": None},
-            },
-        }
-        for index in range(15)
-    ]
 
-    with patch("web.dashboard.st.load_price_extremes", return_value={"windows": windows}):
-        stats = _price_extreme_stats()
-
-    assert len(stats["recent_reversals"]) == 15
 
 
 def test_low_price_winner_stats_counts_each_window_once():

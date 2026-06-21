@@ -18,7 +18,6 @@ import core.market as mkt
 import core.state as st
 from analysis.market_context import analyze_gamma_resolutions, analyze_market_context
 from bot_runtime.end_window_runner import (
-    REVERSAL_MAX_PRICE,
     TIME_MIN_DELTA_USD,
 )
 from strategies import end_window, enabled_strategies
@@ -177,8 +176,6 @@ def _trade_fire_layer(trade: dict) -> str:
         return "ARB15"
     if "BUY-1" in reason.upper():
         return "BUY-1"
-    if "REVERSE" in reason.upper():
-        return "REVERSE"
     if "TIME-6" in reason:
         return "TIME-6"
     if "TIME-5" in reason:
@@ -387,8 +384,6 @@ def _end_window_settings(settings: st.BotSettings | None = None) -> dict:
         "trade_usd": cfg.trade_usd,
         "min_trade_usd": cfg.min_trade_usd,
         "max_trades_per_window": cfg.max_trades_per_window,
-        "reversal_trade_usd": cfg.reversal_trade_usd,
-        "reversal_max_price": REVERSAL_MAX_PRICE,
         "time_min_delta_usd": TIME_MIN_DELTA_USD,
         "max_spread": cfg.max_spread,
         "force_retry_attempts": cfg.force_retry_attempts,
@@ -403,7 +398,7 @@ def _end_window_settings(settings: st.BotSettings | None = None) -> dict:
                 else getattr(settings, f"time{index}_{field}")
             )
             for index in range(1, 7)
-            for field in ("enabled", "price", "trade_usd", "min_secs_left", "max_secs_left")
+            for field in ("enabled", "price", "trade_usd", "min_secs_left", "max_secs_left", "min_delta_usd")
         },
         **{
             f"buy1_{field}": getattr(settings, f"buy1_{field}")
@@ -429,48 +424,6 @@ def _settings_from_dict(data: dict | None) -> st.BotSettings:
     if isinstance(data, dict):
         values.update({key: value for key, value in data.items() if key in values})
     return st.BotSettings(**values)
-
-
-def _price_extreme_stats() -> dict:
-    data = st.load_price_extremes()
-    windows = data.get("windows", [])
-    levels = []
-    recent = []
-    for level in st.PRICE_EXTREME_LEVELS:
-        key = f"{level:.2f}"
-        dual_count = 0
-        for row in windows:
-            hit = (row.get("hits") or {}).get(key) or {}
-            up_ts, down_ts = hit.get("up_ts"), hit.get("down_ts")
-            if up_ts is None or down_ts is None:
-                continue
-            dual_count += 1
-            first_side = "UP" if float(up_ts) <= float(down_ts) else "DOWN"
-            recent.append({
-                "window_ts": int(row.get("window_ts") or 0),
-                "market_slug": row.get("market_slug") or "",
-                "level": level,
-                "first_side": first_side,
-                "second_side": "DOWN" if first_side == "UP" else "UP",
-                "second_hit_ts": max(float(up_ts), float(down_ts)),
-                "max_up_bid": float(row.get("max_up_bid") or 0.0),
-                "max_down_bid": float(row.get("max_down_bid") or 0.0),
-            })
-        total = len(windows)
-        levels.append({
-            "level": level,
-            "dual_hit_windows": dual_count,
-            "recorded_windows": total,
-            "rate_pct": round(dual_count / total * 100, 2) if total else 0.0,
-        })
-    recent.sort(key=lambda row: row["second_hit_ts"], reverse=True)
-    return {
-        "price_source": data.get("price_source", "best_bid"),
-        "sample_interval_secs": data.get("sample_interval_secs", 1.0),
-        "recorded_windows": len(windows),
-        "levels": levels,
-        "recent_reversals": recent,
-    }
 
 
 def _low_price_winner_stats(trades: list[dict]) -> dict:
@@ -586,7 +539,6 @@ def _state_payload() -> dict:
         "trades_total": stats["trades_total"],
         "wins": stats["wins"],
         "losses": stats["losses"],
-        "price_extreme_stats": _price_extreme_stats(),
         "low_price_winner_stats": _low_price_winner_stats(trades),
         "total_pnl": stats["total_pnl"],
         "daily_pnl": today_pnl["pnl"],
@@ -798,16 +750,6 @@ input,select{width:100%;border:1px solid var(--line);background:#0b111c;color:va
   </section>
 
   <section class="panel">
-    <div class="panel-head"><h2>Extreme Price Reversal Research</h2><span id="extremeWindowCount" class="muted">0 windows</span></div>
-    <div class="panel-body">
-      <div id="extremeLevels" class="extreme-grid"></div>
-      <div class="muted" style="margin-top:8px">Counted once per level when both UP and DOWN best bid reach that price in one window.</div>
-      <div id="extremeEvents" class="extreme-events"></div>
-      <div class="trade-footer"><span id="extremePageInfo" class="muted">Page 1 / 1</span><div id="extremePagination" class="pagination"></div></div>
-    </div>
-  </section>
-
-  <section class="panel">
     <div class="panel-head"><h2>Low Price Winner Research</h2><span id="lowWinnerWindowCount" class="muted">0 windows</span></div>
     <div class="panel-body">
       <div id="lowWinnerSummary" class="extreme-grid"></div>
@@ -875,7 +817,7 @@ input,select{width:100%;border:1px solid var(--line);background:#0b111c;color:va
           <section class="settings-section">
             <h3>A. Trading Settings</h3>
             <div class="form-row"><div><span class="label">BTC 5m</span><label class="switch" aria-label="BTC 5m"><input id="market5m" type="checkbox" checked disabled><span class="slider"></span></label></div></div>
-            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label></div>
+            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label><label><span class="label">Profit Stop %</span><input id="profitStopPct" type="number" min="1" step="1" value="100"></label></div>
             <div class="form-row"><label><span class="label">Order type</span><input id="orderType" value="FOK" disabled></label><label><span class="label">Max buy price</span><input id="maxBuyPrice" value="N/A" disabled></label></div>
             <button onclick="saveSettings()">Save Trading Settings</button>
           </section>
@@ -916,7 +858,6 @@ let calDate = new Date();
 const calendarCache = new Map();
 let tradeFilter = 'all';
 let tradePage = 1;
-let extremePage = 1;
 let lowWinnerPage = 1;
 const TRADE_PAGE_SIZE = 100;
 const RESEARCH_PAGE_SIZE = 10;
@@ -972,7 +913,8 @@ async function saveSettings(){
   const body={
    market_5m_enabled:true,
    trade_amount:Number($('tradeAmount').value||0),
-   max_trades_per_window:Number($('maxTrades').value||1)
+   max_trades_per_window:Number($('maxTrades').value||1),
+   profit_stop_pct:Number($('profitStopPct').value||100)
   };
   await post('/api/settings', body); $('settingsSaved').textContent='Saved'; toast('Settings saved');
  }catch(e){toast(e.message)}
@@ -1092,19 +1034,9 @@ function deriveDecision(s){
  const arbCandidate=arbCandidates[0]||null;
  const arbComplete=arbUsed.has('UP')&&arbUsed.has('DOWN');
  const arbReady=arbMode&&arbEnabled&&!arbComplete&&!!arbCandidate&&riskOk&&Number(s.balance||0)>=arbAmount;
- const originalLegs=openLegs.filter((leg)=>!String(leg.trigger_reason||'').toUpperCase().includes('REVERSE'));
- const reverseTrades=openLegs.filter((leg)=>String(leg.trigger_reason||'').toUpperCase().includes('REVERSE'));
- const reversedSourceRefs=new Set(reverseTrades.map((leg)=>{
-  const match=String(leg.trigger_reason||'').match(/source_ref=([^\s;]+)/);
-  return match?match[1]:'*';
- }));
- const sourceRef=(leg)=>leg.order_id?`order-${String(leg.order_id).replaceAll(' ','_')}`:`ts-${Number(leg.timestamp||0).toFixed(6)}`;
- const legacyReverse=reversedSourceRefs.has('*');
- const usedReverse=reverseTrades.length>=2;
- const layerLegs=originalLegs.filter((leg)=>!String(leg.trigger_reason||'').includes('TIME-'));
+ const layerLegs=openLegs.filter((leg)=>!String(leg.trigger_reason||'').includes('TIME-'));
  const slotMode=Number(ew.max_trades_per_window||9)>=3;
  const layerSlotOk=!slotMode||layerLegs.length===0;
- const timeDeltaOk=hasBtcOpen&&absDelta>=Number(ew.time_min_delta_usd||3);
  const timeDefaults={1:.98,2:.99,3:.97,4:.96,5:.95,6:.94};
  const timeStates=[1,2,3,4,5,6].map((index)=>{
   const enabled=ew[`time${index}_enabled`]!==false;
@@ -1112,6 +1044,8 @@ function deriveDecision(s){
   const timeOk=secs<=Number(ew[`time${index}_max_secs_left`]||299)&&secs>Number(ew[`time${index}_min_secs_left`]||3);
   const price=Number(ew[`time${index}_price`]||timeDefaults[index]);
   const amount=Number(ew[`time${index}_trade_usd`]||100);
+  const minDelta=Number(ew[`time${index}_min_delta_usd`]||ew.time_min_delta_usd||3);
+  const deltaOkForTime=hasBtcOpen&&absDelta>=minDelta;
   const quotes=[
    {side:'UP',ask:upAsk,capacity:depthCapacity(upDepth,price)},
    {side:'DOWN',ask:downAsk,capacity:depthCapacity(downDepth,price)},
@@ -1119,39 +1053,14 @@ function deriveDecision(s){
   const candidates=quotes.filter(row=>row.side===side&&row.capacity+1e-9>=amount).sort((a,b)=>b.capacity-a.capacity);
   const candidate=candidates[0]||null;
   const scanning=enabled&&!used&&timeOk;
-  const ready=scanning&&timeDeltaOk&&!!candidate&&riskOk&&Number(s.balance||0)>=amount&&windowCapOk;
-  return {index,label:`TIME-${index}`,enabled,used,timeOk,price,amount,quotes,candidates,candidate,scanning,ready};
+  const ready=scanning&&deltaOkForTime&&!!candidate&&riskOk&&Number(s.balance||0)>=amount&&windowCapOk;
+  return {index,label:`TIME-${index}`,enabled,used,timeOk,price,amount,minDelta,deltaOkForTime,quotes,candidates,candidate,scanning,ready};
  }).sort((a,b)=>a.price-b.price||a.index-b.index);
  const readyTime=timeStates.find(row=>row.ready)||null;
  const scanningTime=timeStates.find(row=>row.scanning)||null;
- const reverseSlotsLeft=Math.max(0,2-reverseTrades.length);
- const reversalLegs=(legacyReverse||reverseSlotsLeft<=0)?[]:originalLegs.filter((leg)=>{
-  const outcome=String(leg.outcome||'').toUpperCase();
-  const entryDelta=Number(leg.btc_distance||0);
-  const entryAligned=(outcome==='UP'&&entryDelta>0)||(outcome==='DOWN'&&entryDelta<0);
-  return !reversedSourceRefs.has(sourceRef(leg))&&entryAligned&&outcome!==side;
- }).slice(0,reverseSlotsLeft);
- const reversalLeg=reversalLegs[0]||null;
- const reversalSide=reversalLeg?side:'';
- const reversalAsk=reversalSide==='DOWN'?downAsk:reversalSide==='UP'?upAsk:0;
- const reversalDepth=reversalSide==='DOWN'?downDepth:upDepth;
- const reversalAmount=Number(ew.reversal_trade_usd||100);
- const reversalRequired=reversalAmount*reversalLegs.length;
- const reversalMaxPrice=Number(ew.reversal_max_price||0.40);
- const reversalPriceOk=reversalAsk>0&&reversalAsk<=reversalMaxPrice;
- const reversalCapacity=depthCapacity(reversalDepth,reversalMaxPrice);
- const reversalOrderbookOk=reversalPriceOk&&reversalCapacity+1e-9>=reversalRequired;
- const reversalMode=!!reversalLeg;
- const reversalReady=reversalMode&&reversalOrderbookOk&&riskOk&&chainlinkFresh&&latencyOk&&Number(s.balance||0)>=reversalRequired;
- let decision='WAIT', reason='Outside end-window', action='No order will be placed';
- if(!running){decision='WAIT';reason=s.emergency_stop?'Emergency stop active':(!stateFresh&&s.trading_enabled?'Bot state stale':'Bot stopped');}
- else if(reversalMode){
-  decision='WAIT REVERSAL';
-  reason=`Delta crossed against open ${String(reversalLeg.outcome||'')} position`;
-  action=`Waiting for ${reversalSide} ask <= ${num(reversalMaxPrice,2)}`;
-  if(reversalReady){decision=`BUY ${reversalLegs.length}x REVERSE ${reversalSide}`;reason='Delta crossed and reverse liquidity is available';action=`Place ${reversalLegs.length} ${reversalSide} reverse orders at ${money(reversalAmount,0)} each`;}
- }
- else if(readyTime){
+  let decision='WAIT', reason='Outside end-window', action='No order will be placed';
+  if(!running){decision='WAIT';reason=s.emergency_stop?'Emergency stop active':(!stateFresh&&s.trading_enabled?'Bot state stale':'Bot stopped');}
+  else if(readyTime){
   decision=`BUY ${readyTime.label} ${readyTime.candidate.side}`;
   reason=`${readyTime.candidate.side} ask reached exactly ${num(readyTime.candidate.ask,2)} with ${money(readyTime.candidate.capacity)} liquidity`;
   action=`Place ${readyTime.candidate.side} FOK order ${money(readyTime.amount,0)} at max ${num(readyTime.price,2)}`;
@@ -1175,7 +1084,7 @@ function deriveDecision(s){
  else {decision=side==='DOWN'?'BUY_DOWN':'BUY_UP';reason=`${side} delta valid, price sane, data fresh, spread safe`;action=`Place ${decision} order`;}
  if(decision==='WAIT'&&secs>maxLayerSeconds&&next){action='No order will be placed';}
  if(decision==='NO_TRADE')action='No order will be placed';
- return {rules,ew,secs,delta,absDelta,side,upAsk,downAsk,upBid,downBid,upDepth,downDepth,activeAsk,oppositeAsk,activeSpread,maxSpread,tradeUsd,active,next,layer,required,minPrice,maxPrice,maxLayerSeconds,sideEdge,age,stateFresh,priceSource,chainlinkAge,exchangeAge,clobAge,latencyMs,maxFeedAge,maxLatencyMs,running,balanceOk,windowCapOk,layerSlotOk,riskOk,chainlinkFresh,exchangeFresh,latencyOk,clobOk,spreadOk,priceOk,sidePriceOk,deltaOk,orderbookOk,activeCapacity,saturated,openLegs,arbMode,arb5Mode,arb15Mode,arbPrefix,arbEnabled,arbPrice,arbAmount,arbLegs,arbUsed:Array.from(arbUsed),arbCandidate,arbComplete,arbReady,reversalLeg,reversalLegs,reversalMode,reversalSide,reversalAsk,reversalMaxPrice,reversalAmount,reversalRequired,reversalPriceOk,reversalCapacity,reversalOrderbookOk,reversalReady,timeDeltaOk,timeStates,readyTime,scanningTime,usedReverse,decision,reason,action};
+ return {rules,ew,secs,delta,absDelta,side,upAsk,downAsk,upBid,downBid,upDepth,downDepth,activeAsk,oppositeAsk,activeSpread,maxSpread,tradeUsd,active,next,layer,required,minPrice,maxPrice,maxLayerSeconds,sideEdge,age,stateFresh,priceSource,chainlinkAge,exchangeAge,clobAge,latencyMs,maxFeedAge,maxLatencyMs,running,balanceOk,windowCapOk,layerSlotOk,riskOk,chainlinkFresh,exchangeFresh,latencyOk,clobOk,spreadOk,priceOk,sidePriceOk,deltaOk,orderbookOk,activeCapacity,saturated,openLegs,arbMode,arb5Mode,arb15Mode,arbPrefix,arbEnabled,arbPrice,arbAmount,arbLegs,arbUsed:Array.from(arbUsed),arbCandidate,arbComplete,arbReady,timeStates,readyTime,scanningTime,decision,reason,action};
 }
 
 function renderDecision(s,d){
@@ -1186,7 +1095,7 @@ function renderDecision(s,d){
  setBadge('decisionBadge', d.decision, kind);
  $('decisionReason').textContent=d.reason;
  $('decisionAction').textContent=d.action;
- $('decisionLayer').textContent=(d.arb15Mode||d.arbReady)?d.arbPrefix:d.reversalMode?'REVERSE':d.readyTime?d.readyTime.label:d.active?`${d.active.display_name} ${d.active.label}`:(d.scanningTime?`${d.scanningTime.label} scanning`:d.next?`Next ${d.next.display_name}`:'N/A');
+ $('decisionLayer').textContent=(d.arb15Mode||d.arbReady)?d.arbPrefix:d.readyTime?d.readyTime.label:d.active?`${d.active.display_name} ${d.active.label}`:(d.scanningTime?`${d.scanningTime.label} scanning`:d.next?`Next ${d.next.display_name}`:'N/A');
  $('decisionSeconds').textContent=d.secs?num(d.secs,1)+'s':'N/A';
  $('decisionRequired').textContent=d.required?money(d.required,0):'N/A';
  $('decisionDelta').textContent=signedMoney(d.delta,1);
@@ -1205,19 +1114,11 @@ function renderDecisionChecklist(d){
    [`Open legs ${Number((d.arbLegs||[]).length)}/2`,!d.arbComplete],
    [`Candidate has ${money(d.arbAmount||100,0)} liquidity`,!!candidate.side],
   ];
- }else if(d.reversalMode){
-  checks=[
-   ['Original entry delta aligned',!!d.reversalLeg],
-   [`Direction crossed to ${d.reversalSide||'opposite'}`,!!d.reversalSide],
-   [`${d.reversalSide||'Opposite'} ask <= ${num(d.reversalMaxPrice||0.40,2)}`,d.reversalPriceOk],
-   [`Orderbook >= ${money(d.reversalRequired,0)} for ${d.reversalLegs.length} trade(s)`,d.reversalOrderbookOk],
-   [`${d.reversalLegs.length} source trade(s) pending reverse`,d.reversalLegs.length>0],
-  ];
  }else if(d.readyTime||(!d.active&&d.scanningTime)){
   const time=d.readyTime||d.scanningTime;
   checks=[
    [`More than ${num(d.ew[`time${time.index}_min_secs_left`]||3,1)}s remaining`,time.timeOk],
-   [`Aligned BTC delta >= ${money(d.ew.time_min_delta_usd||3,0)}`,d.timeDeltaOk&&!!time.candidate],
+   [`Aligned BTC delta >= ${money(time.minDelta||d.ew.time_min_delta_usd||3,0)}`,time.deltaOkForTime&&!!time.candidate],
    [`${d.side} ask exactly ${num(time.price,2)}`,time.quotes.length>0],
    [`Orderbook >= ${money(time.amount,0)}`,time.candidates.length>0],
    [`${time.label} slot unused`,!time.used],
@@ -1330,17 +1231,6 @@ function renderOrderbook(s,d){
  $('currentMarketSlug').textContent=slug||'N/A';
 }
 
-function renderExtremeResearch(s){
- const stats=s.price_extreme_stats||{}, levels=stats.levels||[], rows=stats.recent_reversals||[];
- const totalPages=Math.max(1,Math.ceil(rows.length/RESEARCH_PAGE_SIZE));
- extremePage=Math.min(Math.max(1,extremePage),totalPages);
- const pageRows=rows.slice((extremePage-1)*RESEARCH_PAGE_SIZE,extremePage*RESEARCH_PAGE_SIZE);
- $('extremeWindowCount').textContent=`${Number(stats.recorded_windows||0)} windows recorded`;
- $('extremeLevels').innerHTML=levels.map(row=>`<div class="extreme-level"><div class="price">${num(row.level,2)}</div><div><strong>${Number(row.dual_hit_windows||0)}</strong> dual-hit reversals</div><div class="muted">${pct(row.rate_pct)} of ${Number(row.recorded_windows||0)} windows</div></div>`).join('')||'<div class="muted">Collecting price history...</div>';
- $('extremeEvents').innerHTML=pageRows.length?pageRows.map(row=>`<div class="reason-item wait"><div><strong>${num(row.level,2)} ${esc(row.first_side)} -> ${esc(row.second_side)}</strong><div class="muted">${esc(row.market_slug)} | peaks UP ${num(row.max_up_bid,2)} / DOWN ${num(row.max_down_bid,2)}</div></div><div class="mono">${fmtTime(row.second_hit_ts)}</div></div>`).join(''):'<div class="muted">No dual-hit reversal recorded yet.</div>';
- renderPagination('extreme',extremePage,totalPages,rows.length);
-}
-
 function renderLowWinnerResearch(s){
  const stats=s.low_price_winner_stats||{}, rows=stats.recent||[];
  const totalPages=Math.max(1,Math.ceil(rows.length/RESEARCH_PAGE_SIZE));
@@ -1363,8 +1253,8 @@ function renderPagination(kind,page,totalPages,totalRows){
 }
 
 function setPage(kind,page){
+ if(!lastState){return}
  if(kind==='trade'){tradePage=page;renderTrades(lastState);return}
- if(kind==='extreme'){extremePage=page;renderExtremeResearch(lastState);return}
  if(kind==='lowWinner'){lowWinnerPage=page;renderLowWinnerResearch(lastState)}
 }
 
@@ -1415,7 +1305,7 @@ function renderLayers(s,d){
  const saved=s.saved_end_window_settings||d.ew;
  const timeEditors=[1,2,3,4,5,6].map(i=>{
   const enabled=saved[`time${i}_enabled`]!==false;
-  return `<div class="rule-editor"><div class="rule-head"><strong>TIME-${i}</strong><label class="switch"><input data-setting="time${i}_enabled" type="checkbox" ${enabled?'checked':''}><span class="slider"></span></label></div><div class="rule-fields time"><label>Exact price<input data-setting="time${i}_price" type="number" min="0.01" max="0.99" step="0.01" value="${num(saved[`time${i}_price`],2)}"></label><label>Buy when <= (s)<input data-setting="time${i}_max_secs_left" type="number" min="0.1" max="300" step="0.1" value="${num(saved[`time${i}_max_secs_left`]||299,1)}"></label><label>Stop below (s)<input data-setting="time${i}_min_secs_left" type="number" min="0" max="299" step="0.1" value="${num(saved[`time${i}_min_secs_left`],1)}"></label><label>Liquidity / USD<input data-setting="time${i}_trade_usd" type="number" min="1" step="1" value="${num(saved[`time${i}_trade_usd`],0)}"></label></div></div>`;
+  return `<div class="rule-editor"><div class="rule-head"><strong>TIME-${i}</strong><label class="switch"><input data-setting="time${i}_enabled" type="checkbox" ${enabled?'checked':''}><span class="slider"></span></label></div><div class="rule-fields time"><label>Exact price<input data-setting="time${i}_price" type="number" min="0.01" max="0.99" step="0.01" value="${num(saved[`time${i}_price`],2)}"></label><label>Buy when <= (s)<input data-setting="time${i}_max_secs_left" type="number" min="0.1" max="300" step="0.1" value="${num(saved[`time${i}_max_secs_left`]||299,1)}"></label><label>Stop below (s)<input data-setting="time${i}_min_secs_left" type="number" min="0" max="299" step="0.1" value="${num(saved[`time${i}_min_secs_left`],1)}"></label><label>Liquidity / USD<input data-setting="time${i}_trade_usd" type="number" min="1" step="1" value="${num(saved[`time${i}_trade_usd`],0)}"></label><label>Min delta $<input data-setting="time${i}_min_delta_usd" type="number" min="0" step="1" value="${num(saved[`time${i}_min_delta_usd`]||saved.time_min_delta_usd||3,1)}"></label></div></div>`;
  }).join('');
  const buy1Enabled=saved.buy1_enabled!==false;
  const buy1Editor=`<div class="rule-editor"><div class="rule-head"><strong>BUY-1</strong><label class="switch"><input data-setting="buy1_enabled" type="checkbox" ${buy1Enabled?'checked':''}><span class="slider"></span></label></div><div class="rule-fields"><label>Trade USD<input data-setting="buy1_trade_usd" type="number" min="1" step="1" value="${num(saved.buy1_trade_usd,0)}"></label><label>Buy min<input data-setting="buy1_min_price" type="number" min="0.01" max="0.99" step="0.01" value="${num(saved.buy1_min_price,2)}"></label><label>Buy max<input data-setting="buy1_max_price" type="number" min="0.01" max="0.99" step="0.01" value="${num(saved.buy1_max_price,2)}"></label><label>Sell min<input data-setting="buy1_sell_min_price" type="number" min="0.01" max="0.99" step="0.01" value="${num(saved.buy1_sell_min_price,2)}"></label><label>Sell max<input data-setting="buy1_sell_max_price" type="number" min="0.01" max="0.99" step="0.01" value="${num(saved.buy1_sell_max_price,2)}"></label><label>Delta $<input data-setting="buy1_min_delta_usd" type="number" min="0" step="1" value="${num(saved.buy1_min_delta_usd,1)}"></label><label>Start (s)<input data-setting="buy1_max_secs_left" type="number" min="0.1" max="300" step="0.1" value="${num(saved.buy1_max_secs_left,1)}"></label><label>End (s)<input data-setting="buy1_min_secs_left" type="number" min="0" max="299" step="0.1" value="${num(saved.buy1_min_secs_left,1)}"></label><label>Max open<input data-setting="buy1_max_open_positions" type="number" min="1" max="9" step="1" value="${num(saved.buy1_max_open_positions,0)}"></label></div></div>`;
@@ -1566,10 +1456,14 @@ function renderPnlCharts(s){
 
 function renderPnlSummary(s){
  const p=s.pnl_summary||{};
+ const totalPnl = p.total_pnl ?? s.total_pnl ?? 0;
+ const totalCap = p.total_capital || 1000;
+ const profitPct = totalCap > 0 ? (totalPnl / totalCap * 100) : 0;
  const items=[
   ['Modal saat ini',money(p.current_capital??s.balance),'mono'],
-  ['Total modal',money(p.total_capital??1000),'mono'],
-  ['Total PnL',money(p.total_pnl??s.total_pnl),'mono '+clsBy(p.total_pnl??s.total_pnl)],
+  ['Total modal',money(totalCap),'mono'],
+  ['Total PnL',money(totalPnl),'mono '+clsBy(totalPnl)],
+  ['Profit (%)',pct(profitPct),'mono '+clsBy(profitPct)],
   ['Today PnL',money(s.daily_pnl),'mono '+clsBy(s.daily_pnl)],
   ['Win rate',pct(p.win_rate??s.win_rate),'mono'],
   ['Total trades',String(p.total_trades??s.trades_total??0),'mono'],
@@ -1584,7 +1478,7 @@ function renderState(s){
  lastState=s;
  const d=deriveDecision(s);
  renderTopBar(s,d); renderDecision(s,d); renderBtcDelta(s,d); renderOrderbook(s,d);
- renderChecklist(s,d); renderLayers(s,d); renderHealth(s,d); renderExtremeResearch(s); renderLowWinnerResearch(s); renderTrades(s); renderPnlSummary(s); renderPnlCharts(s);
+ renderChecklist(s,d); renderLayers(s,d); renderHealth(s,d); renderLowWinnerResearch(s); renderTrades(s); renderPnlSummary(s); renderPnlCharts(s);
  if(s.pnl_calendar){
   const key=calendarKey(s.pnl_calendar.year,s.pnl_calendar.month);
   calendarCache.set(key,s.pnl_calendar);
@@ -1594,6 +1488,7 @@ function renderState(s){
  if(document.activeElement!==$('market5m'))$('market5m').checked=settings.market_5m_enabled!==false;
  if(document.activeElement!==$('tradeAmount'))$('tradeAmount').value=Number(settings.trade_usd||active.trade_amount||100).toFixed(0);
  if(document.activeElement!==$('maxTrades'))$('maxTrades').value=Number(settings.max_trades_per_window||active.max_trades_per_window||1);
+ if(document.activeElement!==$('profitStopPct'))$('profitStopPct').value=Number(active.profit_stop_pct||100).toFixed(0);
  $('orderType').value=settings.order_type||'FOK';
  $('maxBuyPrice').value=d.maxPrice?num(d.maxPrice,2):'N/A';
  $('maxSpreadSetting').value=settings.max_spread!==undefined?num(settings.max_spread,3):'N/A';
@@ -1690,6 +1585,19 @@ async def api_settings_get(_request: web.Request) -> web.Response:
     return web.json_response(data)
 
 
+async def api_health(_request: web.Request) -> web.Response:
+    state = st.load_state()
+    return web.json_response({
+        "ok": True,
+        "service": "poly-v3-dashboard",
+        "mock_mode": bool(config.MOCK_MODE),
+        "trading_enabled": bool(st.get_trading_enabled()),
+        "emergency_stop": bool(st.get_emergency_stop()),
+        "last_update": state.get("last_update"),
+        "current_window": state.get("current_window"),
+    })
+
+
 async def api_settings_post(request: web.Request) -> web.Response:
     if not _auth_ok(request):
         return web.json_response({"success": False, "error": "unauthorized"}, status=401)
@@ -1713,6 +1621,7 @@ async def api_settings_post(request: web.Request) -> web.Response:
             or key.startswith("time")
             or key.startswith("buy1_")
             or key == "market_5m_enabled"
+            or key == "profit_stop_pct"
         )
     }
     try:
@@ -1879,6 +1788,7 @@ def main():
     app.router.add_get("/", index)
     app.router.add_get("/stream", stream)
     app.router.add_get("/api/state", api_state)
+    app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/pnl-calendar", api_pnl_calendar)
     app.router.add_post("/api/control", api_control)
     app.router.add_get("/api/settings", api_settings_get)

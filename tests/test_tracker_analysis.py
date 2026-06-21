@@ -53,11 +53,17 @@ def test_trade_layer_uses_reason_then_secs_left_fallback():
 
 
 def test_tracker_metadata_reflects_saved_settings():
-    settings = BotSettings(time3_price=0.96, time3_min_secs_left=4.5, t6_delta_min=14.0)
+    settings = BotSettings(
+        time3_price=0.96,
+        time3_min_secs_left=4.5,
+        time3_min_delta_usd=14.0,
+        t6_delta_min=14.0,
+    )
     meta = build_end_window_meta(settings)
 
     assert meta["TIME-3"]["price"] == "exactly 0.96"
     assert meta["TIME-3"]["time"] == "Any time above 4.5s"
+    assert "BTC delta >= $14" in meta["TIME-3"]["req"]
     assert meta["T6"]["req"] == "BTC delta >= $14"
     assert meta["BUY-1"]["price"] == "buy 0.50-0.60"
     assert "sell 0.80-0.90" in meta["BUY-1"]["req"]

@@ -1,0 +1,17 @@
+[Unit]
+Description=Poly V3 tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=__APP_DIR__
+Environment=PYTHONUNBUFFERED=1
+ExecStart=__APP_DIR__/.venv/bin/python -u -m analysis.tracker
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+

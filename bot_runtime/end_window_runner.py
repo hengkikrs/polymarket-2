@@ -24,11 +24,6 @@ _last_skip_log: dict[tuple[str, str], float] = {}
 DIRECT_BOOK_TIMEOUT_SECS = max(0.05, float(os.getenv("END_WINDOW_DIRECT_BOOK_TIMEOUT_SECS", "0.20")))
 DIRECT_BOOK_CACHE_MAX_AGE_SECS = max(0.05, float(os.getenv("END_WINDOW_DIRECT_BOOK_CACHE_MAX_AGE_SECS", "1.0")))
 TIME_MIN_DELTA_USD = 3.0
-REVERSAL_MAX_PRICE = max(
-    0.01,
-    float(os.getenv("END_WINDOW_REVERSAL_MAX_PRICE", os.getenv("END_WINDOW_REVERSAL_TRIGGER_PRICE", "0.40"))),
-)
-MAX_REVERSALS_PER_WINDOW = 2
 TIME_DEFAULT_PRICES = {1: 0.98, 2: 0.99, 3: 0.97, 4: 0.96, 5: 0.95, 6: 0.94}
 
 
@@ -44,16 +39,6 @@ def _log_forced_skip(market_slug: str, reason: str, secs_left: float, cfg: end_w
         return
     _last_skip_log[key] = now
     log.info("[END_WINDOW] forced skip %s: %s", market_slug, reason)
-
-
-def _log_reverse_skip(market_slug: str, reason: str) -> None:
-    reason_key = str(reason or "").split(":", 1)[0]
-    key = (str(market_slug or ""), f"reverse_{reason_key}")
-    now = time.time()
-    if now - _last_skip_log.get(key, 0.0) < 1.0:
-        return
-    _last_skip_log[key] = now
-    log.info("[END_WINDOW] reverse skip %s: %s", market_slug, reason)
 
 
 def _open_strategy_legs(window_ts: int, market_slug: str) -> list[dict]:
@@ -101,10 +86,9 @@ def _trade_slot(trade: dict) -> str:
         return "ARB15"
     if "BUY-1" in reason:
         return "BUY-1"
-    if "REVERSE-1" in reason:
-        return "REVERSE-1"
-    if "REVERSE" in reason:
-        return "REVERSE"
+    if "FAST-OPEN" in reason:
+        return "FAST"
+
     if "TIME-6" in reason:
         return "TIME-6"
     if "TIME-5" in reason:
@@ -143,51 +127,6 @@ def _trade_reference(trade: dict) -> str:
     if order_id:
         return f"order-{order_id.replace(' ', '_')}"
     return f"ts-{float(trade.get('timestamp') or 0.0):.6f}"
-
-
-def _reversed_source_refs(strategy_trades: list[dict]) -> set[str]:
-    refs: set[str] = set()
-    for trade in strategy_trades:
-        if _trade_slot(trade) not in {"REVERSE", "REVERSE-1"}:
-            continue
-        reason = str(trade.get("trigger_reason") or "")
-        marker = "source_ref="
-        if marker not in reason:
-            refs.add("*")
-            continue
-        refs.add(reason.split(marker, 1)[1].split()[0].rstrip(";"))
-    return refs
-
-
-def _next_reverse_source(
-    open_legs: list[dict],
-    current_outcome: str,
-    used_slots: set[str],
-    reversed_source_refs: set[str] | None = None,
-) -> tuple[dict, str] | None:
-    if current_outcome not in {"UP", "DOWN"}:
-        return None
-    reversed_source_refs = reversed_source_refs or set()
-    if "*" in reversed_source_refs:
-        return None
-    if "REVERSE-1" in used_slots:
-        return None
-    source_slot = "REVERSE" if "REVERSE" in used_slots else ""
-    next_slot = "REVERSE-1" if source_slot == "REVERSE" else "REVERSE"
-    candidates = [
-        trade for trade in open_legs
-        if (
-            (_trade_slot(trade) == source_slot)
-            if source_slot
-            else _trade_slot(trade) not in {"REVERSE", "REVERSE-1"}
-        )
-        and str(trade.get("outcome") or "").upper() != current_outcome
-        and _entry_delta_aligned(trade)
-        and _trade_reference(trade) not in reversed_source_refs
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda trade: float(trade.get("timestamp") or 0.0)), next_slot
 
 
 def _side_price(market: BTCMarket, btc_open: float, btc_now: float) -> tuple[str, str, str, float, float]:
@@ -358,6 +297,7 @@ def _time_screening_rules(settings: st.BotSettings, time_enabled: dict[int, bool
             float(getattr(settings, f"time{index}_trade_usd", 100.0)),
             float(getattr(settings, f"time{index}_min_secs_left", 3.0)),
             float(getattr(settings, f"time{index}_max_secs_left", 299.0)),
+            float(getattr(settings, f"time{index}_min_delta_usd", TIME_MIN_DELTA_USD)),
         )
         for index in range(1, 7)
     ]
@@ -642,7 +582,6 @@ async def try_end_window_market(
     settings: st.BotSettings | None = None,
     book_reserved_usd: float = 0.0,
     reserved_slots: set[str] | None = None,
-    reversed_source_refs: set[str] | None = None,
 ) -> Optional[st.TradeRecord]:
     settings = settings or st.load_settings()
     cfg = cfg or end_window.EndWindowConfig.from_settings(settings)
@@ -677,78 +616,16 @@ async def try_end_window_market(
     used_slots = {_trade_slot(trade) for trade in strategy_trades}
     used_slots.update(reserved_slots or set())
     delta_outcome = _delta_outcome(btc_open, btc_now)
-    reversed_refs = _reversed_source_refs(strategy_trades)
-    reversed_refs.update(reversed_source_refs or set())
-    reverse_count = sum(1 for trade in strategy_trades if _trade_slot(trade) in {"REVERSE", "REVERSE-1"})
-    reverse_candidate = _next_reverse_source(
-        open_legs,
-        delta_outcome,
-        used_slots,
-        reversed_refs,
-    )
-    if reverse_count >= MAX_REVERSALS_PER_WINDOW:
-        reverse_candidate = None
-    reverse_source, reverse_slot = reverse_candidate if reverse_candidate else (None, "")
-    reversal = reverse_source is not None
-    reversal_layer = _trade_slot(reverse_source) if reverse_source else ""
     ignore_slippage = False
 
-    if reversal:
-        side, outcome, token, price, spread = _side_price(market, btc_open, btc_now)
-        if outcome != delta_outcome:
-            _log_reverse_skip(
-                market_slug,
-                f"delta_changed: expected={delta_outcome or 'NONE'} current={outcome or 'NONE'}",
-            )
-            return None
-        if (
-            (not config.MOCK_MODE and book_reserved_usd > 0)
-            or
-            _selected_book_age(market, outcome) > DIRECT_BOOK_CACHE_MAX_AGE_SECS
-            or not _selected_ask_depth(market, outcome)
-        ):
-            market = await _refresh_side_book(session, market, outcome)
-            side, outcome, token, price, spread = _side_price(market, btc_open, btc_now)
-        if outcome != delta_outcome:
-            _log_reverse_skip(
-                market_slug,
-                f"delta_changed_after_refresh: expected={delta_outcome or 'NONE'} current={outcome or 'NONE'}",
-            )
-            return None
-        if price <= 0:
-            _log_reverse_skip(market_slug, f"ask_unavailable: outcome={outcome}")
-            return None
-        if price > REVERSAL_MAX_PRICE:
-            _log_reverse_skip(
-                market_slug,
-                f"ask_above_cap: outcome={outcome} ask={price:.4f} cap={REVERSAL_MAX_PRICE:.4f}",
-            )
-            return None
-        decision = end_window.EndWindowDecision(
-            True,
-            side=side,
-            price=price,
-            layer=reverse_slot,
-            reason=(
-                f"{reverse_slot}: initial={reverse_source.get('outcome')} "
-                f"source={reversal_layer} "
-                f"source_ref={_trade_reference(reverse_source)} "
-                f"entry_delta={float(reverse_source.get('btc_distance') or 0.0):+.2f} "
-                f"current_delta={float(btc_now or 0.0) - float(btc_open or 0.0):+.2f} "
-                f"opposite_ask={price:.4f} cap={REVERSAL_MAX_PRICE:.4f}"
-            ),
-        )
-    else:
-        if (
-            not enabled_layers
-            and not any(time_enabled.values())
-            and not bool(getattr(settings, "buy1_enabled", True))
-        ):
-            return None
+    if (
+        not enabled_layers
+        and not any(time_enabled.values())
+        and not bool(getattr(settings, "buy1_enabled", True))
+    ):
+        return None
 
-    buy1 = None
-    if not reversal:
-        buy1 = _buy1_candidate(
+    buy1 = _buy1_candidate(
             market,
             btc_open,
             btc_now,
@@ -759,86 +636,88 @@ async def try_end_window_market(
             used_slots,
             strategy_trades,
         )
-        if buy1:
-            side, outcome, token, price, spread, amount = buy1
-            if (
-                _selected_book_age(market, outcome) > DIRECT_BOOK_CACHE_MAX_AGE_SECS
-                or not _selected_ask_depth(market, outcome)
-            ):
-                market = await _refresh_side_book(session, market, outcome)
-                buy1 = _buy1_candidate(
-                    market,
-                    btc_open,
-                    btc_now,
-                    secs_left,
-                    bankroll_usd,
-                    settings,
-                    cfg,
-                    used_slots,
-                    strategy_trades,
-                )
-                if not buy1:
-                    return None
-                side, outcome, token, price, spread, amount = buy1
-            if not config.MOCK_MODE:
-                gate = safety.validate_market_for_entry(
-                    market,
-                    [outcome],
-                    {outcome: amount},
-                    live=True,
-                    existing_window_exposure_usd=sum(
-                        float(trade.get("amount_usd") or 0.0)
-                        for trade in strategy_trades
-                    ),
-                )
-                if not gate.ok:
-                    log.warning("[BUY-1] live safety skip %s %s: %s", market_slug, outcome, gate.reason)
-                    return None
-            mock_fill = (
-                _mock_fok_fill(market, outcome, amount, price)
-                if config.MOCK_MODE
-                else None
+    if buy1:
+        side, outcome, token, price, spread, amount = buy1
+        if (
+            _selected_book_age(market, outcome) > DIRECT_BOOK_CACHE_MAX_AGE_SECS
+            or not _selected_ask_depth(market, outcome)
+        ):
+            market = await _refresh_side_book(session, market, outcome)
+            buy1 = _buy1_candidate(
+                market,
+                btc_open,
+                btc_now,
+                secs_left,
+                bankroll_usd,
+                settings,
+                cfg,
+                used_slots,
+                strategy_trades,
             )
-            if config.MOCK_MODE and mock_fill is None:
-                _log_forced_skip(market_slug, "BUY-1 mock_fok_unfilled", secs_left, cfg)
+            if not buy1:
                 return None
-            reason = (
-                f"BUY-1 {outcome}: quick buy ask={price:.4f} "
-                f"buy_range={float(getattr(settings, 'buy1_min_price', 0.50)):.2f}-"
-                f"{float(getattr(settings, 'buy1_max_price', 0.60)):.2f} "
-                f"sell_target={float(getattr(settings, 'buy1_sell_min_price', 0.80)):.2f}-"
-                f"{float(getattr(settings, 'buy1_sell_max_price', 0.90)):.2f} "
-                f"delta={float(btc_now or 0.0) - float(btc_open or 0.0):+.2f} "
-                f"target={btc_open:.2f} btc_now={btc_now:.2f}"
+            side, outcome, token, price, spread, amount = buy1
+        if not config.MOCK_MODE:
+            gate = safety.validate_market_for_entry(
+                market,
+                [outcome],
+                {outcome: amount},
+                live=True,
+                existing_window_exposure_usd=sum(
+                    float(trade.get("amount_usd") or 0.0)
+                    for trade in strategy_trades
+                ),
             )
-            return await _execute_buy(
-                market=market,
-                side=side,
-                outcome=outcome,
-                token=token,
-                price=price,
-                amount_usd=amount,
-                reason=reason,
-                spread=spread,
-                secs_elapsed=secs_elapsed,
-                secs_left=secs_left,
-                btc_open=btc_open,
-                btc_now=btc_now,
-                strict_price=True,
-                mock_fill=mock_fill,
-            )
+            if not gate.ok:
+                log.warning("[BUY-1] live safety skip %s %s: %s", market_slug, outcome, gate.reason)
+                return None
+        mock_fill = (
+            _mock_fok_fill(market, outcome, amount, price)
+            if config.MOCK_MODE
+            else None
+        )
+        if config.MOCK_MODE and mock_fill is None:
+            _log_forced_skip(market_slug, "BUY-1 mock_fok_unfilled", secs_left, cfg)
+            return None
+        reason = (
+            f"BUY-1 {outcome}: quick buy ask={price:.4f} "
+            f"buy_range={float(getattr(settings, 'buy1_min_price', 0.50)):.2f}-"
+            f"{float(getattr(settings, 'buy1_max_price', 0.60)):.2f} "
+            f"sell_target={float(getattr(settings, 'buy1_sell_min_price', 0.80)):.2f}-"
+            f"{float(getattr(settings, 'buy1_sell_max_price', 0.90)):.2f} "
+            f"delta={float(btc_now or 0.0) - float(btc_open or 0.0):+.2f} "
+            f"target={btc_open:.2f} btc_now={btc_now:.2f}"
+        )
+        return await _execute_buy(
+            market=market,
+            side=side,
+            outcome=outcome,
+            token=token,
+            price=price,
+            amount_usd=amount,
+            reason=reason,
+            spread=spread,
+            secs_elapsed=secs_elapsed,
+            secs_left=secs_left,
+            btc_open=btc_open,
+            btc_now=btc_now,
+            strict_price=True,
+            mock_fill=mock_fill,
+        )
     time_trigger = ""
     time_price = 0.0
     time_amount = 0.0
     time_min_secs_left = 0.0
     time_candidate = None
-    time_outcome = _delta_outcome(btc_open, btc_now, TIME_MIN_DELTA_USD)
-    if not reversal and time_outcome and (slot_mode or not open_legs):
-        for trigger, enabled, target_price, requested_amount, min_secs_left, max_secs_left in _time_screening_rules(
+    if slot_mode or not open_legs:
+        for trigger, enabled, target_price, requested_amount, min_secs_left, max_secs_left, min_delta_usd in _time_screening_rules(
             settings,
             time_enabled,
         ):
             if secs_left <= float(min_secs_left) or secs_left > float(max_secs_left):
+                continue
+            time_outcome = _delta_outcome(btc_open, btc_now, min_delta_usd)
+            if not time_outcome:
                 continue
             if not config.MOCK_MODE:
                 requested_amount = min(float(requested_amount or 0.0), cfg.live_trade_usd)
@@ -854,9 +733,7 @@ async def try_end_window_market(
                 time_candidate = candidate
                 break
 
-    if reversal:
-        pass
-    elif time_candidate:
+    if time_candidate:
         side, outcome, token, observed_ask, spread = time_candidate
         if (
             (not config.MOCK_MODE and book_reserved_usd > 0)
@@ -888,9 +765,7 @@ async def try_end_window_market(
         market = await _refresh_side_book(session, market, outcome)
         side, outcome, token, price, spread = _side_price(market, btc_open, btc_now)
 
-    if reversal:
-        pass
-    elif time_candidate:
+    if time_candidate:
         decision = end_window.EndWindowDecision(
             True,
             side=side,
@@ -912,17 +787,41 @@ async def try_end_window_market(
             opposite_price=_opposite_ask(market, outcome),
         )
         if not decision.ok:
-            _log_forced_skip(market_slug, decision.reason, secs_left, cfg)
-            return None
+            # ── FIX #3: FAST-LANE OPEN (rescue, non-preempting) ──────────────
+            # Tidak ada layer/TIME yang cocok, tapi sisi unggul sudah pada/lewat
+            # fast_open_price dengan delta searah & spread lolos → tangkap segera
+            # (1x per window, slot "FAST") agar tidak miss karena latency.
+            # Depth & safety gate diverifikasi di jalur eksekusi bersama di bawah.
+            fast_aligned = bool(outcome) and _delta_outcome(btc_open, btc_now) == outcome
+            if (
+                cfg.fast_open_enabled
+                and "FAST" not in used_slots
+                and fast_aligned
+                and float(price or 0.0) >= float(cfg.fast_open_price)
+                and float(price or 0.0) <= float(cfg.fast_open_max_price)
+                and (cfg.max_spread <= 0 or float(spread or 0.0) <= cfg.max_spread)
+            ):
+                decision = end_window.EndWindowDecision(
+                    True,
+                    side=side,
+                    price=price,
+                    layer="FAST",
+                    reason=(
+                        f"FAST-OPEN {outcome}: ask={float(price):.4f}>="
+                        f"{float(cfg.fast_open_price):.2f} spread={float(spread or 0.0):.4f} "
+                        f"delta={float(btc_now) - float(btc_open):+.2f}"
+                    ),
+                )
+            else:
+                _log_forced_skip(market_slug, decision.reason, secs_left, cfg)
+                return None
 
-    requested_amount = time_amount if time_candidate else cfg.reversal_trade_usd if reversal else cfg.trade_usd
-    if not config.MOCK_MODE and not reversal:
+    requested_amount = time_amount if time_candidate else cfg.trade_usd
+    if not config.MOCK_MODE:
         requested_amount = min(float(requested_amount or 0.0), cfg.live_trade_usd)
     amount = min(float(requested_amount or 0.0), float(bankroll_usd or 0.0))
     min_trade_usd = (
-        cfg.reversal_trade_usd
-        if reversal
-        else cfg.min_trade_usd
+        cfg.min_trade_usd
         if config.MOCK_MODE
         else cfg.live_trade_usd
     )
@@ -950,11 +849,9 @@ async def try_end_window_market(
     min_allowed_secs = (
         time_min_secs_left
         if time_candidate
-        else 0.0
-        if reversal
         else min((layer.seconds_left_min for layer in cfg.layers), default=0.0)
     )
-    attempts = 1 if time_candidate or reversal else max(1, int(cfg.force_retry_attempts if cfg.force_trade else 1))
+    attempts = 1 if time_candidate else max(1, int(cfg.force_retry_attempts if cfg.force_trade else 1))
     delay = max(0.0, float(cfg.force_retry_delay_secs or 0.0))
     for attempt in range(attempts):
         remaining = max(0.0, float(getattr(market, "close_ts", 0) or 0) - time.time())
@@ -987,7 +884,7 @@ async def try_end_window_market(
                 _log_forced_skip(market_slug, retry_decision.reason, max(0.0, remaining), cfg)
                 break
 
-        final_attempt = not time_candidate and not reversal and cfg.force_trade and attempt == attempts - 1
+        final_attempt = not time_candidate and cfg.force_trade and attempt == attempts - 1
         trade_price = float(decision.price or price or 0.0)
         strict_price = True
         skip_preflight = False
@@ -1013,10 +910,7 @@ async def try_end_window_market(
         capacity = max(0.0, _ask_capacity_usd(market, outcome, trade_price) - reserved_capacity)
         if capacity + 1e-9 < amount:
             skip_reason = f"insufficient_ask_depth: available=${capacity:.2f} required=${amount:.2f}"
-            if reversal:
-                _log_reverse_skip(market_slug, skip_reason)
-            else:
-                _log_forced_skip(market_slug, skip_reason, max(0.0, remaining), cfg)
+            _log_forced_skip(market_slug, skip_reason, max(0.0, remaining), cfg)
             break
         mock_fill = (
             _mock_fok_fill(
@@ -1031,10 +925,7 @@ async def try_end_window_market(
         )
         if config.MOCK_MODE and mock_fill is None:
             skip_reason = "mock_fok_unfilled: depth changed before execution"
-            if reversal:
-                _log_reverse_skip(market_slug, skip_reason)
-            else:
-                _log_forced_skip(market_slug, skip_reason, max(0.0, remaining), cfg)
+            _log_forced_skip(market_slug, skip_reason, max(0.0, remaining), cfg)
             break
 
         rec = await _execute_buy(
@@ -1078,7 +969,6 @@ async def try_all_end_window(
     remaining_bankroll = float(bankroll_usd or 0.0)
     reserved_by_outcome: dict[str, float] = {"UP": 0.0, "DOWN": 0.0}
     reserved_slots: set[str] = set()
-    reversed_source_refs: set[str] = set()
     active_cfg = cfg or end_window.EndWindowConfig.from_settings(settings or st.load_settings())
     max_attempts = max(1, int(active_cfg.max_trades_per_window))
     for _ in range(max_attempts):
@@ -1095,7 +985,6 @@ async def try_all_end_window(
             settings=settings,
             book_reserved_usd=reserved_by_outcome.get(current_outcome, 0.0),
             reserved_slots=reserved_slots,
-            reversed_source_refs=reversed_source_refs,
         )
         if rec is None:
             break
@@ -1105,15 +994,7 @@ async def try_all_end_window(
         if outcome in reserved_by_outcome:
             reserved_by_outcome[outcome] += float(rec.amount_usd or 0.0)
         slot = _trade_slot({"trigger_reason": rec.trigger_reason})
-        if slot in {"REVERSE", "REVERSE-1"}:
-            marker = "source_ref="
-            if marker in str(rec.trigger_reason or ""):
-                reversed_source_refs.add(
-                    str(rec.trigger_reason).split(marker, 1)[1].split()[0].rstrip(";")
-                )
-            reserved_slots.add(slot)
-        else:
-            reserved_slots.add(slot)
+        reserved_slots.add(slot)
     return records
 
 

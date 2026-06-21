@@ -164,7 +164,6 @@ class MarketAnalysis:
     sell_loss_percent: float
     additional_capital: float
     expected_profit_if_correct: float
-    worst_case_reversal_profit: float
     risk_level: str
     reason: str
 
@@ -307,7 +306,6 @@ def _analyze_entry(
         sell_loss_percent=0.0,
         additional_capital=0.0,
         expected_profit_if_correct=round(locked_profit, 6),
-        worst_case_reversal_profit=round(locked_profit, 6),
         risk_level=_risk_level(locked_profit, total_modal),
         reason="; ".join(reasons),
     )
@@ -589,7 +587,6 @@ def _position_output(
         sell_loss_percent=round(sell_loss_percent, 4),
         additional_capital=round(additional_capital, 6),
         expected_profit_if_correct=round(expected_profit, 6),
-        worst_case_reversal_profit=round(worst_case, 6),
         risk_level=risk_level,
         reason=reason,
     )

@@ -59,7 +59,6 @@ T2_ENABLED = _b("T2_ENABLED", "true")   # Early (40-100s) — primary winner (75
 T3_ENABLED = _b("T3_ENABLED", "true")   # Momentum (80-165s) — strict filter via cfg
 T4_ENABLED = _b("T4_ENABLED", "false")  # Mid (140-220s) — OFF: reversal death zone
 T5_ENABLED = _b("T5_ENABLED", "false")  # Late (200-265s) — OFF: 0% WR
-T6_ENABLED = _b("T6_ENABLED", "false")  # Reversal — OFF: counter-trend risky
 T7_ENABLED = _b("T7_ENABLED", "true")   # Scalp (250-280s) — last-second momentum
 TX_ENABLED = _b("TX_ENABLED", "false")  # Last-second — OFF: no edge, no time for SL
 
@@ -71,7 +70,6 @@ def get_enabled_triggers() -> set:
     if T3_ENABLED: enabled.add("T3")
     if T4_ENABLED: enabled.add("T4")
     if T5_ENABLED: enabled.add("T5")
-    if T6_ENABLED: enabled.add("T6")
     if T7_ENABLED: enabled.add("T7")
     if TX_ENABLED: enabled.add("TX")
     return enabled
@@ -121,14 +119,6 @@ T5_PRICE_MIN   = _f("T5_PRICE_MIN",   0.65)
 T5_PRICE_MAX   = _f("T5_PRICE_MAX",   0.88)
 T5_DELTA_MIN   = _f("T5_DELTA_MIN",   20.0)
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  T6: Reversal (100-150s) — counter-trend, harga sisi baru murah
-# ═══════════════════════════════════════════════════════════════════════════
-T6_ELAPSED_MIN = _f("T6_ELAPSED_MIN", 100.0)
-T6_ELAPSED_MAX = _f("T6_ELAPSED_MAX", 150.0)
-T6_PRICE_MIN   = _f("T6_PRICE_MIN",   0.50)
-T6_PRICE_MAX   = _f("T6_PRICE_MAX",   0.62)
-T6_DELTA_MIN   = _f("T6_DELTA_MIN",   5.0)
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  T7: Scalp (250-280s) — entry cepat di akhir window

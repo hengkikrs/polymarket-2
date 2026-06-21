@@ -47,6 +47,26 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+# ── Feed freshness watchdog (FIX #1: stabilkan chainlink/exchange age) ───────
+# heartbeat lebih pendek = deteksi koneksi setengah-mati lebih cepat.
+# stale-receive timeout = jika tidak ada message dalam N detik, paksa reconnect
+# (mencegah age memanjat diam-diam saat socket half-open).
+WS_HEARTBEAT_SECS: float = _env_float("WS_HEARTBEAT_SECS", 10.0)
+WS_STALE_RECV_SECS: float = _env_float("WS_STALE_RECV_SECS", 6.0)
+
+
+async def _recv_or_stale(ws, stale_secs: float):
+    """Terima 1 message WS dengan batas waktu staleness.
+
+    Return aiohttp WSMessage, atau None jika timeout (caller harus reconnect).
+    Membuat age terikat <= stale_secs alih-alih menunggu heartbeat default.
+    """
+    try:
+        return await asyncio.wait_for(ws.receive(), timeout=max(1.0, float(stale_secs)))
+    except asyncio.TimeoutError:
+        return None
+
+
 def _clob_poll_interval(token_count: int, target_rpm: float, min_sweep_interval: float) -> float:
     token_count = max(1, int(token_count or 1))
     target_rpm = max(60.0, float(target_rpm or 60.0))
@@ -233,7 +253,7 @@ async def _ws_gateio(cache: PriceCache, stop_event: asyncio.Event):
         try:
             connector = _make_connector()
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.ws_connect(url, heartbeat=20, timeout=15) as ws:
+                async with session.ws_connect(url, heartbeat=WS_HEARTBEAT_SECS, timeout=15) as ws:
                     log.info("Gate.io WS connected")
                     await ws.send_str(sub_msg)
                     backoff = 1  # reset on success
@@ -297,7 +317,7 @@ async def _ws_coinbase(cache: PriceCache, stop_event: asyncio.Event):
         try:
             connector = _make_connector()
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.ws_connect(url, heartbeat=20, timeout=15) as ws:
+                async with session.ws_connect(url, heartbeat=WS_HEARTBEAT_SECS, timeout=15) as ws:
                     await ws.send_str(ticker_subscription)
                     await ws.send_str(heartbeat_subscription)
                     log.info("Coinbase BTC-USD WS connected")
@@ -360,12 +380,20 @@ async def _ws_chainlink(cache: PriceCache, stop_event: asyncio.Event):
         try:
             connector = _make_connector()
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.ws_connect(url, heartbeat=20, timeout=15) as ws:
+                async with session.ws_connect(url, heartbeat=WS_HEARTBEAT_SECS, timeout=15) as ws:
                     await ws.send_str(subscription)
                     log.info("Polymarket Chainlink WS connected")
                     backoff = 1
-                    async for msg in ws:
-                        if stop_event.is_set():
+                    while not stop_event.is_set():
+                        msg = await _recv_or_stale(ws, WS_STALE_RECV_SECS)
+                        if msg is None:
+                            # Tidak ada update dalam WS_STALE_RECV_SECS → socket
+                            # mungkin half-open. Putus & reconnect agar age tidak
+                            # memanjat (FIX #1).
+                            log.warning(
+                                "Chainlink WS stale >%.1fs (age=%.1fs) — reconnect",
+                                WS_STALE_RECV_SECS, cache.source_btc_age("chainlink"),
+                            )
                             break
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
@@ -409,7 +437,7 @@ async def _ws_binance(cache: PriceCache, stop_event: asyncio.Event):
         try:
             connector = _make_connector()
             async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.ws_connect(url, heartbeat=20, timeout=15) as ws:
+                async with session.ws_connect(url, heartbeat=WS_HEARTBEAT_SECS, timeout=15) as ws:
                     log.info("Binance WS connected (fallback)")
                     backoff = 1
 

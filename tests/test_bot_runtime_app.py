@@ -170,7 +170,7 @@ def test_end_window_buys_hundred_dollar_reverse_at_forty_cents_for_every_strateg
         trade_usd=100.0,
         min_trade_usd=100.0,
         max_trades_per_window=4,
-        reversal_trade_usd=100.0,
+
     )
     fake_record = SimpleNamespace(trigger="END_WINDOW")
 
@@ -223,7 +223,7 @@ def test_end_window_reverse_is_extra_slot_after_normal_trade_cap():
         trade_usd=100.0,
         min_trade_usd=100.0,
         max_trades_per_window=9,
-        reversal_trade_usd=100.0,
+
     )
     fake_record = SimpleNamespace(trigger="END_WINDOW")
 
@@ -322,7 +322,7 @@ def test_end_window_buys_reverse_1_when_direction_flips_back():
     cfg = end_window.EndWindowConfig(
         enabled=True,
         max_trades_per_window=4,
-        reversal_trade_usd=100.0,
+
     )
     fake_record = SimpleNamespace(trigger="END_WINDOW")
 
@@ -380,7 +380,7 @@ def test_end_window_buys_only_one_first_reverse_per_window():
         trade_usd=100.0,
         min_trade_usd=100.0,
         max_trades_per_window=9,
-        reversal_trade_usd=50.0,
+
     )
 
     async def execute(**kwargs):
@@ -1356,6 +1356,46 @@ def test_time_triggers_do_not_trade_in_last_three_seconds():
     buy.assert_not_awaited()
 
 
+def test_time_min_delta_setting_blocks_exact_price_entry():
+    market = _market(
+        up_ask=0.99,
+        up_price=0.98,
+        up_ask_depth=[(0.99, 102.0)],
+    )
+    cfg = end_window.EndWindowConfig(enabled=True, trade_usd=100.0, min_trade_usd=100.0)
+    settings = SimpleNamespace(
+        time1_enabled=True, time2_enabled=True,
+        time1_min_delta_usd=3.0, time2_min_delta_usd=10.0,
+        t1_enabled=False, t2_enabled=False, t3_enabled=False,
+        t4_enabled=False, t5_enabled=False, t6_enabled=False,
+    )
+    prior_time1 = {
+        "window_ts": market.window_ts,
+        "market_slug": market.slug,
+        "trigger": "END_WINDOW",
+        "trigger_reason": "END_WINDOW UP TIME-1: ask=0.9800",
+        "resolved": False,
+    }
+
+    with (
+        patch("bot_runtime.end_window_runner.st.load_settings", return_value=settings),
+        patch("bot_runtime.end_window_runner.st.load_trades", return_value=[prior_time1]),
+        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock()) as buy,
+    ):
+        out = asyncio.run(end_window_runner.try_end_window_market(
+            market=market,
+            btc_open=64_000.0,
+            btc_now=64_003.0,
+            secs_elapsed=100.0,
+            secs_left=200.0,
+            bankroll_usd=1_000.0,
+            cfg=cfg,
+        ))
+
+    assert out is None
+    buy.assert_not_awaited()
+
+
 def test_time3_fires_at_exact_097_after_other_time_slots():
     market = _market(
         up_ask=0.97,
@@ -1608,11 +1648,18 @@ def test_closed_directional_orphan_retry_picks_up_pending_end_window_trade():
     resolve_window.assert_awaited_once_with(None, pending_window, source="retry-official")
 
 
-def test_btc_now_rejects_exchange_price_without_chainlink():
+def test_btc_now_fallbacks_to_exchange_price_without_chainlink():
     bot = Bot.__new__(Bot)
     bot._last_btc_rest_ts = 0.0
     bot._last_btc_rest_price = 0.0
-    cache = SimpleNamespace(btc_age=0.2, btc_price=100.0, btc_source="gateio")
+    prices = {"gateio": 100.0}
+    cache = SimpleNamespace(
+        btc_age=0.2, 
+        btc_price=100.0, 
+        btc_source="gateio",
+        source_btc=lambda source, _max_age: prices.get(source),
+        source_btc_age=lambda _source: 0.2,
+    )
 
     with (
         patch("bot_runtime.app.get_cache", return_value=cache),
@@ -1620,16 +1667,23 @@ def test_btc_now_rejects_exchange_price_without_chainlink():
     ):
         price = asyncio.run(bot._btc_now(None))
 
-    assert price == 0.0
-    assert bot._last_btc_source == "chainlink-unavailable"
+    assert price == 100.0
+    assert bot._last_btc_source == "gateio (fallback)"
     fetch_price.assert_not_awaited()
 
 
-def test_btc_now_rejects_cached_exchange_price_without_chainlink():
+def test_btc_now_fallbacks_to_cached_exchange_price_without_chainlink():
     bot = Bot.__new__(Bot)
     bot._last_btc_rest_ts = time.time()
     bot._last_btc_rest_price = 99.0
-    cache = SimpleNamespace(btc_age=0.1, btc_price=100.0, btc_source="gateio")
+    prices = {"gateio": 100.0}
+    cache = SimpleNamespace(
+        btc_age=0.1, 
+        btc_price=100.0, 
+        btc_source="gateio",
+        source_btc=lambda source, _max_age: prices.get(source),
+        source_btc_age=lambda _source: 0.1,
+    )
 
     with (
         patch("bot_runtime.app.get_cache", return_value=cache),
@@ -1637,8 +1691,8 @@ def test_btc_now_rejects_cached_exchange_price_without_chainlink():
     ):
         price = asyncio.run(bot._btc_now(None))
 
-    assert price == 0.0
-    assert bot._last_btc_source == "chainlink-unavailable"
+    assert price == 100.0
+    assert bot._last_btc_source == "gateio (fallback)"
     fetch_price.assert_not_awaited()
 
 

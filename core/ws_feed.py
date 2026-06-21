@@ -243,7 +243,7 @@ async def _ws_gateio(cache: PriceCache, stop_event: asyncio.Event):
     url = "wss://api.gateio.ws/ws/v4/"
     sub_msg = json.dumps({
         "time": int(time.time()),
-        "channel": "spot.tickers",
+        "channel": "spot.book_ticker",
         "event": "subscribe",
         "payload": ["BTC_USDT"]
     })
@@ -264,11 +264,13 @@ async def _ws_gateio(cache: PriceCache, stop_event: asyncio.Event):
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = json.loads(msg.data)
-                                if data.get("channel") == "spot.tickers" and data.get("event") == "update":
+                                if data.get("channel") == "spot.book_ticker" and data.get("event") == "update":
                                     result = data.get("result", {})
-                                    last = result.get("last")
-                                    if last:
-                                        cache.set_btc(float(last), "gateio")
+                                    bid = result.get("b")
+                                    ask = result.get("a")
+                                    if bid and ask:
+                                        mid_price = (float(bid) + float(ask)) / 2.0
+                                        cache.set_btc(mid_price, "gateio")
                             except (ValueError, KeyError, TypeError):
                                 pass
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -425,7 +427,7 @@ async def _ws_binance(cache: PriceCache, stop_event: asyncio.Event):
     """
     import aiohttp
 
-    url = "wss://stream.binance.com:9443/ws/btcusdt@ticker"
+    url = "wss://stream.binance.com:9443/ws/btcusdt@bookTicker"
     backoff = 1
 
     while not stop_event.is_set():
@@ -450,9 +452,11 @@ async def _ws_binance(cache: PriceCache, stop_event: asyncio.Event):
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
                                 data = json.loads(msg.data)
-                                last = data.get("c")  # Binance ticker: "c" = last price
-                                if last:
-                                    cache.set_btc(float(last), "binance")
+                                bid = data.get("b")
+                                ask = data.get("a")
+                                if bid and ask:
+                                    mid_price = (float(bid) + float(ask)) / 2.0
+                                    cache.set_btc(mid_price, "binance")
                             except (ValueError, KeyError, TypeError):
                                 pass
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):

@@ -25,7 +25,7 @@ from strategies import enabled_strategies
 from strategies import end_window as end_window_strategy
 
 
-TICK_INTERVAL: float = float(os.getenv("TICK_INTERVAL", "0.05"))
+TICK_INTERVAL: float = float(os.getenv("TICK_INTERVAL", "0.01"))
 SAVE_STATE_INTERVAL: float = float(os.getenv("SAVE_STATE_INTERVAL", "0.5"))
 SNAPSHOT_INTERVAL: float = float(os.getenv("SNAPSHOT_INTERVAL", "1.0"))
 FAST_REFRESH_SECS_LEFT: float = float(os.getenv("FAST_REFRESH_SECS_LEFT", "8.0"))

@@ -1030,8 +1030,8 @@ def apply_gamma_actual_correction(window_ts: int, market_slug: str,
 def save_trade(trade: TradeRecord):
     trades = load_trades()
     trades.append(asdict(trade))
-    if len(trades) > 2000:
-        trades = trades[-2000:]
+    if len(trades) > 50000:
+        trades = trades[-50000:]
     _atomic_write(TRADES_FILE, json.dumps(trades, indent=2))
     _remember_json(TRADES_FILE, trades)
 

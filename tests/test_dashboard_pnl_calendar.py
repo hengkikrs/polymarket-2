@@ -160,13 +160,13 @@ def test_recent_trades_reports_first_spread_na_side_after_price_gate():
     }
 
 
-def test_recent_trades_labels_reverse_before_source_strategy():
+def test_recent_trades_labels_removed_reverse_by_source_strategy():
     trade = {
         "trigger_reason": "END_WINDOW DOWN REVERSE: initial=UP source=TIME-3",
         "secs_left": 2.0,
     }
 
-    assert _trade_fire_layer(trade) == "REVERSE"
+    assert _trade_fire_layer(trade) == "TIME-3"
 
 
 def test_recent_trades_labels_buy1_strategy():
@@ -178,13 +178,13 @@ def test_recent_trades_labels_buy1_strategy():
     assert _trade_fire_layer(trade) == "BUY-1"
 
 
-def test_recent_trades_labels_arb5_strategy():
+def test_recent_trades_treats_legacy_arb_as_plain_layer():
     trade = {
         "trigger_reason": "END_WINDOW DOWN ARB5-DOWN: leg=2/2",
         "secs_left": 120.0,
     }
 
-    assert _trade_fire_layer(trade) == "ARB5-DOWN"
+    assert _trade_fire_layer(trade) == "N/A"
 
 
 def test_dashboard_exposes_dynamic_market_link():
@@ -259,16 +259,16 @@ def test_health_endpoint_exposes_non_secret_runtime_status():
     assert "POLYMARKET_PRIVATE_KEY" not in response.text
 
 
-def test_market_settings_force_btc_5m_only(tmp_path, monkeypatch):
+def test_removed_market_settings_are_ignored(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "SETTINGS_FILE", tmp_path / "settings.json")
 
     settings = st.update_settings({"market_15m_enabled": True})
-    assert settings.market_15m_enabled is False
+    assert not hasattr(settings, "market_15m_enabled")
     assert settings.market_5m_enabled is True
 
     settings = st.update_settings({"market_5m_enabled": True})
     assert settings.market_5m_enabled is True
-    assert settings.market_15m_enabled is False
+    assert not hasattr(settings, "market_15m_enabled")
 
 
 def test_settings_post_syncs_market_choice_to_active_state(tmp_path, monkeypatch):
@@ -287,8 +287,8 @@ def test_settings_post_syncs_market_choice_to_active_state(tmp_path, monkeypatch
     state_data = st.load_state()
 
     assert payload["success"] is True
-    assert payload["settings"]["market_15m_enabled"] is False
-    assert state_data["active_settings"]["market_15m_enabled"] is False
+    assert "market_15m_enabled" not in payload["settings"]
+    assert "market_15m_enabled" not in state_data["active_settings"]
     assert state_data["active_settings"]["market_5m_enabled"] is True
     assert state_data["market_interval_label"] == "5m"
     assert state_data["market_interval_secs"] == 300

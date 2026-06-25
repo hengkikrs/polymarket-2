@@ -32,13 +32,12 @@ for stream in (sys.stdout, sys.stderr):
 
 try:
     from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreatedEvent
-except ImportError:
-    print("=" * 60)
-    print("  watchdog belum terinstall. Jalankan:")
-    print("  pip install watchdog")
-    print("=" * 60)
-    sys.exit(1)
+    from watchdog.events import FileSystemEventHandler
+    WATCHDOG_IMPORT_ERROR: ImportError | None = None
+except ImportError as exc:
+    Observer = None
+    FileSystemEventHandler = object
+    WATCHDOG_IMPORT_ERROR = exc
 
 
 # ── Config ──────────────────────────────────────────────────────
@@ -456,6 +455,12 @@ class ProcessManager:
 
 
 def main():
+    if WATCHDOG_IMPORT_ERROR is not None:
+        print("=" * 60)
+        print("  watchdog belum terinstall. Jalankan:")
+        print("  pip install watchdog")
+        print("=" * 60)
+        sys.exit(1)
     bot_only = "--bot" in sys.argv
     supervisor_lock = SupervisorLock()
     acquired, existing_pid = supervisor_lock.acquire()

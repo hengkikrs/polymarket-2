@@ -29,6 +29,10 @@ PORT = int(os.getenv("DASH_PORT", "5004"))
 HOST = os.getenv("DASH_HOST", "127.0.0.1")
 AUTH_TOKEN = os.getenv("DASH_TOKEN", "").strip()
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+STATE_RECENT_TRADE_LIMIT = max(50, int(float(os.getenv("DASH_STATE_RECENT_TRADE_LIMIT", "250"))))
+STATE_PNL_HISTORY_LIMIT = max(50, int(float(os.getenv("DASH_STATE_PNL_HISTORY_LIMIT", "250"))))
+STATE_RESEARCH_LIMIT = max(10, int(float(os.getenv("DASH_STATE_RESEARCH_LIMIT", "50"))))
+STATE_CONTEXT_SNAPSHOT_LIMIT = max(500, int(float(os.getenv("DASH_STATE_CONTEXT_SNAPSHOT_LIMIT", "2500"))))
 _gamma_context = analyze_gamma_resolutions([])
 
 
@@ -162,18 +166,6 @@ def _ui_layer_name(seconds_left_max: float) -> str:
 
 def _trade_fire_layer(trade: dict) -> str:
     reason = str(trade.get("trigger_reason") or "")
-    if "ARB5-DOWN" in reason.upper():
-        return "ARB5-DOWN"
-    if "ARB5-UP" in reason.upper():
-        return "ARB5-UP"
-    if "ARB5" in reason.upper():
-        return "ARB5"
-    if "ARB15-DOWN" in reason.upper():
-        return "ARB15-DOWN"
-    if "ARB15-UP" in reason.upper():
-        return "ARB15-UP"
-    if "ARB15" in reason.upper():
-        return "ARB15"
     if "BUY-1" in reason.upper():
         return "BUY-1"
     if "TIME-6" in reason:
@@ -287,12 +279,17 @@ def _first_spread_na_by_window(snapshots: list[dict]) -> dict[int, dict]:
     return out
 
 
-def _recent_trades(trades: list[dict], snapshots: list[dict] | None = None) -> list[dict]:
+def _recent_trades(
+    trades: list[dict],
+    snapshots: list[dict] | None = None,
+    *,
+    limit: int = 1000,
+) -> list[dict]:
     spread_na_by_window = _first_spread_na_by_window(
         snapshots if snapshots is not None else st.load_snapshots()
     )
     rows: list[dict] = []
-    for trade in reversed(trades[-1000:]):
+    for trade in reversed(trades[-limit:]):
         btc_open = float(trade.get("btc_open") or 0.0)
         btc_at_entry = float(trade.get("btc_at_entry") or 0.0)
         raw_delta = float(trade.get("btc_distance") or 0.0)
@@ -339,10 +336,13 @@ def _recent_trades(trades: list[dict], snapshots: list[dict] | None = None) -> l
     return rows
 
 
-def _pnl_history(trades: list[dict]) -> list[dict]:
+def _pnl_history(trades: list[dict], *, limit: int | None = None) -> list[dict]:
     rows: list[dict] = []
     cumulative = 0.0
-    for trade in sorted(trades, key=lambda item: float(item.get("timestamp") or 0.0)):
+    ordered = sorted(trades, key=lambda item: float(item.get("timestamp") or 0.0))
+    if limit is not None and limit > 0:
+        ordered = ordered[-limit:]
+    for trade in ordered:
         if not trade.get("resolved"):
             continue
         pnl = float(trade.get("pnl") or 0.0)
@@ -415,7 +415,7 @@ def _end_window_settings(settings: st.BotSettings | None = None) -> dict:
                 "max_open_positions",
             )
         },
-        "order_type": "FOK",
+        "order_type": "Market FOK",
     }
 
 
@@ -424,6 +424,33 @@ def _settings_from_dict(data: dict | None) -> st.BotSettings:
     if isinstance(data, dict):
         values.update({key: value for key, value in data.items() if key in values})
     return st.BotSettings(**values)
+
+
+def _price_extreme_stats() -> dict:
+    data = st.load_price_extremes()
+    windows = data.get("windows", []) if isinstance(data, dict) else []
+    levels: dict[str, dict] = {}
+    for row in windows:
+        hits = row.get("hits", {}) if isinstance(row, dict) else {}
+        if not isinstance(hits, dict):
+            continue
+        for level, sides in hits.items():
+            bucket = levels.setdefault(
+                str(level),
+                {"level": float(level), "up_hits": 0, "down_hits": 0, "windows": 0},
+            )
+            if isinstance(sides, dict):
+                up_hit = sides.get("up_ts") is not None
+                down_hit = sides.get("down_ts") is not None
+                bucket["up_hits"] += 1 if up_hit else 0
+                bucket["down_hits"] += 1 if down_hit else 0
+                bucket["windows"] += 1 if up_hit or down_hit else 0
+    return {
+        "price_source": data.get("price_source", "") if isinstance(data, dict) else "",
+        "sample_interval_secs": data.get("sample_interval_secs", 0.0) if isinstance(data, dict) else 0.0,
+        "recorded_windows": len(windows),
+        "levels": sorted(levels.values(), key=lambda item: item["level"]),
+    }
 
 
 def _low_price_winner_stats(trades: list[dict]) -> dict:
@@ -485,7 +512,8 @@ def _low_price_winner_stats(trades: list[dict]) -> dict:
 def _state_payload() -> dict:
     state = st.load_state()
     snapshots = st.load_snapshots()
-    context = analyze_market_context(snapshots)
+    context_snapshots = snapshots[-STATE_CONTEXT_SNAPSHOT_LIMIT:]
+    context = analyze_market_context(context_snapshots)
     state.update({
         "current_regime": context["regime"],
         "regime_reason": context["reason"],
@@ -529,6 +557,8 @@ def _state_payload() -> dict:
     stats = st.calc_stats(trades)
     pnl_calendar = _build_pnl_calendar(trades)
     today_pnl = pnl_calendar["today"]
+    low_price_winner_stats = _low_price_winner_stats(trades)
+    low_price_winner_stats["recent"] = low_price_winner_stats.get("recent", [])[:STATE_RESEARCH_LIMIT]
     state.update({
         "strategy_mode": _strategy_label(),
         "balance": bal.get("balance", 0.0),
@@ -539,20 +569,24 @@ def _state_payload() -> dict:
         "trades_total": stats["trades_total"],
         "wins": stats["wins"],
         "losses": stats["losses"],
-        "low_price_winner_stats": _low_price_winner_stats(trades),
+        "low_price_winner_stats": low_price_winner_stats,
         "total_pnl": stats["total_pnl"],
         "daily_pnl": today_pnl["pnl"],
         "daily_trades": today_pnl["trade_count"],
         "daily_wins": today_pnl["wins"],
         "daily_losses": today_pnl["losses"],
         "win_rate": stats["win_rate"],
-        "recent_trades": _recent_trades(trades, snapshots),
+        "recent_trades": _recent_trades(
+            trades,
+            context_snapshots,
+            limit=STATE_RECENT_TRADE_LIMIT,
+        ),
         "end_window_rules": _end_window_rules(active_settings),
         "end_window_settings": _end_window_settings(active_settings),
         "saved_end_window_rules": _end_window_rules(saved_settings),
         "saved_end_window_settings": _end_window_settings(saved_settings),
         "pnl_summary": _pnl_summary(trades, stats, bal),
-        "pnl_history": _pnl_history(trades),
+        "pnl_history": _pnl_history(trades, limit=STATE_PNL_HISTORY_LIMIT),
         "pnl_calendar": pnl_calendar,
         "trading_enabled": st.get_trading_enabled(),
         "emergency_stop": st.get_emergency_stop(),
@@ -932,7 +966,7 @@ async function saveLayerSettings(){
 }
 async function toggleLayer(layer, enabled){
  try{
-  const timeMatch=String(layer).match(/^TIME-(\d)$/);
+  const timeMatch=String(layer).match(/^TIME-(\\d)$/);
   const key=timeMatch?`time${timeMatch[1]}_enabled`:`${String(layer).toLowerCase()}_enabled`;
   await post('/api/settings',{[key]:!!enabled});
   toast(`${layer} ${enabled?'enabled':'disabled'}`);
@@ -1022,18 +1056,6 @@ function deriveDecision(s){
  const upAvailable=upAsk>0||upBid>0, downAvailable=downAsk>0||downBid>0;
  const saturated=upAvailable!==downAvailable;
  const openLegs=(Array.isArray(s.open_legs)?s.open_legs:[]).filter((leg)=>!s.current_window||Number(leg.window_ts||0)===Number(s.current_window||0));
- const arb15Mode=false, arb5Mode=false, arbMode=false, arbEnabled=false;
- const arbPrefix='ARB';
- const arbPrice=0, arbAmount=0;
- const arbLegs=openLegs.filter((leg)=>String(leg.trigger_reason||'').toUpperCase().includes(arbPrefix));
- const arbUsed=new Set(arbLegs.map((leg)=>String(leg.outcome||'').toUpperCase()));
- const arbCandidates=[
-  {side:'UP',ask:upAsk,capacity:depthCapacity(upDepth,arbPrice)},
-  {side:'DOWN',ask:downAsk,capacity:depthCapacity(downDepth,arbPrice)},
- ].filter(row=>!arbUsed.has(row.side)&&row.ask>0&&row.ask<=arbPrice&&row.capacity+1e-9>=arbAmount).sort((a,b)=>a.ask-b.ask||(a.side==='UP'?-1:1));
- const arbCandidate=arbCandidates[0]||null;
- const arbComplete=arbUsed.has('UP')&&arbUsed.has('DOWN');
- const arbReady=arbMode&&arbEnabled&&!arbComplete&&!!arbCandidate&&riskOk&&Number(s.balance||0)>=arbAmount;
  const layerLegs=openLegs.filter((leg)=>!String(leg.trigger_reason||'').includes('TIME-'));
  const slotMode=Number(ew.max_trades_per_window||9)>=3;
  const layerSlotOk=!slotMode||layerLegs.length===0;
@@ -1084,7 +1106,7 @@ function deriveDecision(s){
  else {decision=side==='DOWN'?'BUY_DOWN':'BUY_UP';reason=`${side} delta valid, price sane, data fresh, spread safe`;action=`Place ${decision} order`;}
  if(decision==='WAIT'&&secs>maxLayerSeconds&&next){action='No order will be placed';}
  if(decision==='NO_TRADE')action='No order will be placed';
- return {rules,ew,secs,delta,absDelta,side,upAsk,downAsk,upBid,downBid,upDepth,downDepth,activeAsk,oppositeAsk,activeSpread,maxSpread,tradeUsd,active,next,layer,required,minPrice,maxPrice,maxLayerSeconds,sideEdge,age,stateFresh,priceSource,chainlinkAge,exchangeAge,clobAge,latencyMs,maxFeedAge,maxLatencyMs,running,balanceOk,windowCapOk,layerSlotOk,riskOk,chainlinkFresh,exchangeFresh,latencyOk,clobOk,spreadOk,priceOk,sidePriceOk,deltaOk,orderbookOk,activeCapacity,saturated,openLegs,arbMode,arb5Mode,arb15Mode,arbPrefix,arbEnabled,arbPrice,arbAmount,arbLegs,arbUsed:Array.from(arbUsed),arbCandidate,arbComplete,arbReady,timeStates,readyTime,scanningTime,decision,reason,action};
+ return {rules,ew,secs,delta,absDelta,side,upAsk,downAsk,upBid,downBid,upDepth,downDepth,activeAsk,oppositeAsk,activeSpread,maxSpread,tradeUsd,active,next,layer,required,minPrice,maxPrice,maxLayerSeconds,sideEdge,age,stateFresh,priceSource,chainlinkAge,exchangeAge,clobAge,latencyMs,maxFeedAge,maxLatencyMs,running,balanceOk,windowCapOk,layerSlotOk,riskOk,chainlinkFresh,exchangeFresh,latencyOk,clobOk,spreadOk,priceOk,sidePriceOk,deltaOk,orderbookOk,activeCapacity,saturated,openLegs,timeStates,readyTime,scanningTime,decision,reason,action};
 }
 
 function renderDecision(s,d){
@@ -1095,7 +1117,7 @@ function renderDecision(s,d){
  setBadge('decisionBadge', d.decision, kind);
  $('decisionReason').textContent=d.reason;
  $('decisionAction').textContent=d.action;
- $('decisionLayer').textContent=(d.arb15Mode||d.arbReady)?d.arbPrefix:d.readyTime?d.readyTime.label:d.active?`${d.active.display_name} ${d.active.label}`:(d.scanningTime?`${d.scanningTime.label} scanning`:d.next?`Next ${d.next.display_name}`:'N/A');
+ $('decisionLayer').textContent=d.readyTime?d.readyTime.label:d.active?`${d.active.display_name} ${d.active.label}`:(d.scanningTime?`${d.scanningTime.label} scanning`:d.next?`Next ${d.next.display_name}`:'N/A');
  $('decisionSeconds').textContent=d.secs?num(d.secs,1)+'s':'N/A';
  $('decisionRequired').textContent=d.required?money(d.required,0):'N/A';
  $('decisionDelta').textContent=signedMoney(d.delta,1);
@@ -1105,16 +1127,7 @@ function renderDecision(s,d){
 
 function renderDecisionChecklist(d){
  let checks=[];
- if(d.arb15Mode||d.arbReady){
-  const candidate=d.arbCandidate||{};
-  checks=[
-   [`${d.arbPrefix} market selected`,d.arbMode===true],
-   [`${d.arbPrefix} enabled`,d.arbEnabled!==false],
-   [`UP/DOWN leg cap ${num(d.arbPrice||0.43,2)}`,true],
-   [`Open legs ${Number((d.arbLegs||[]).length)}/2`,!d.arbComplete],
-   [`Candidate has ${money(d.arbAmount||100,0)} liquidity`,!!candidate.side],
-  ];
- }else if(d.readyTime||(!d.active&&d.scanningTime)){
+ if(d.readyTime||(!d.active&&d.scanningTime)){
   const time=d.readyTime||d.scanningTime;
   checks=[
    [`More than ${num(d.ew[`time${time.index}_min_secs_left`]||3,1)}s remaining`,time.timeOk],
@@ -1284,14 +1297,12 @@ function renderChecklist(s,d){
 
 function renderLayers(s,d){
  let hint='Outside end-window';
- if(d.arbReady)hint=d.arbComplete?`${d.arbPrefix} complete`:(d.arbCandidate?`${d.arbPrefix} ready: ${d.arbCandidate.side}`:`${d.arbPrefix} waiting for UP/DOWN ask cap`);
- else if(d.active)hint=`Active layer: ${d.active.display_name} ${d.active.label}`;
+ if(d.active)hint=`Active layer: ${d.active.display_name} ${d.active.label}`;
  else if(d.secs>d.maxLayerSeconds)hint=`Next trigger in ${num(d.secs-d.maxLayerSeconds,1)} seconds`;
  const finalCutoff=Math.min(...d.rules.map(r=>Number(r.seconds_left_min||0)),4);
  if(d.secs<=finalCutoff)hint='NO_TRADE zone: retry disabled';
  $('layerHint').textContent=hint;
- setBadge('layerSummary', d.arbReady?`${d.arbPrefix} READY`:d.active?`${d.active.display_name} ACTIVE`:d.secs<=finalCutoff?'NO_TRADE':'WAIT', d.arbReady?'up':d.active?'up':d.secs<=finalCutoff?'no':'wait');
- const arbRow=d.arbMode?`<div class="layer ${d.arbReady?'active':d.arbComplete?'expired':'next'}"><strong>${esc(d.arbPrefix)}</strong><div><div>BTC ${d.arb15Mode?'15m':'5m'} arbitrage: buy UP and DOWN <= ${num(d.arbPrice||0.43,2)}</div><div class="hint">leg size ${money(d.arbAmount||100,0)} | open ${(d.arbLegs||[]).length}/2</div></div><span class="status-pill ${d.arbReady?'active':d.arbComplete?'expired':'next'}">${d.arbReady?'READY':d.arbComplete?'DONE':'WAIT'}</span></div>`:'';
+ setBadge('layerSummary', d.active?`${d.active.display_name} ACTIVE`:d.secs<=finalCutoff?'NO_TRADE':'WAIT', d.active?'up':d.secs<=finalCutoff?'no':'wait');
  const rows=d.rules.map((r)=>{
   let status='LOCKED', cls='locked';
   if(r.enabled===false){status='OFF';cls='expired'}
@@ -1300,7 +1311,7 @@ function renderLayers(s,d){
   else if(!d.active&&d.next&&d.next.name===r.name){status='NEXT';cls='next'}
   return `<div class="layer ${cls}"><strong>${esc(r.display_name)}</strong><div><div>${esc(r.label)}: t <= ${num(r.seconds_left_max,0)}s and > ${num(r.seconds_left_min,0)}s</div><div class="hint">delta >= ${money(r.min_distance_usd,0)} | price ${num(r.min_price,2)}-${num(r.max_price,2)}</div></div><span class="status-pill ${cls}">${status}</span></div>`;
  }).join('');
- $('layers').innerHTML=arbRow+rows+`<div class="layer no-trade"><strong>&lt;${num(finalCutoff,1)}s</strong><div><div>NO TRADE</div><div class="hint">retry disabled</div></div><span class="status-pill no">${d.secs<=finalCutoff?'ACTIVE':'LOCKED'}</span></div>`;
+ $('layers').innerHTML=rows+`<div class="layer no-trade"><strong>&lt;${num(finalCutoff,1)}s</strong><div><div>NO TRADE</div><div class="hint">retry disabled</div></div><span class="status-pill no">${d.secs<=finalCutoff?'ACTIVE':'LOCKED'}</span></div>`;
  const savedRules=s.saved_end_window_rules||d.rules;
  const saved=s.saved_end_window_settings||d.ew;
  const timeEditors=[1,2,3,4,5,6].map(i=>{

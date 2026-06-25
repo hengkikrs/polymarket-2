@@ -72,18 +72,6 @@ def _strategy_trades(window_ts: int, market_slug: str) -> list[dict]:
 
 def _trade_slot(trade: dict) -> str:
     reason = str(trade.get("trigger_reason") or "").upper()
-    if "ARB5-DOWN" in reason:
-        return "ARB5-DOWN"
-    if "ARB5-UP" in reason:
-        return "ARB5-UP"
-    if "ARB5" in reason:
-        return "ARB5"
-    if "ARB15-DOWN" in reason:
-        return "ARB15-DOWN"
-    if "ARB15-UP" in reason:
-        return "ARB15-UP"
-    if "ARB15" in reason:
-        return "ARB15"
     if "BUY-1" in reason:
         return "BUY-1"
     if "FAST-OPEN" in reason:

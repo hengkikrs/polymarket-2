@@ -124,13 +124,6 @@ def _safe_read_json(path: Path, default=None):
 class BotSettings:
     strategy_settings_version: int = 1
     market_5m_enabled: bool       = True
-    market_15m_enabled: bool      = False
-    arb5_enabled: bool            = False
-    arb5_price: float             = 0.43
-    arb5_trade_usd: float         = 100.0
-    arb15_enabled: bool           = False
-    arb15_price: float            = 0.43
-    arb15_trade_usd: float        = 100.0
     max_trades_per_window: int   = 9
     trade_amount: float          = 100.0
     max_loss_per_trade: float    = 10.0
@@ -266,9 +259,6 @@ def _apply_env_setting_overrides(s: BotSettings) -> BotSettings:
     except Exception as e:
         log.warning("settings env override error: %s", e)
     s.market_5m_enabled = True
-    s.market_15m_enabled = False
-    s.arb5_enabled = False
-    s.arb15_enabled = False
     return s
 
 
@@ -367,7 +357,7 @@ def update_settings(data: dict) -> BotSettings:
         "time1_enabled", "time2_enabled", "time3_enabled",
         "time4_enabled", "time5_enabled", "time6_enabled",
         "buy1_enabled",
-        "market_5m_enabled", "market_15m_enabled", "arb5_enabled", "arb15_enabled",
+        "market_5m_enabled",
         "cb_master_enabled", "cb_session_loss_enabled",
         "cb_daily_loss_enabled", "cb_consec_loss_enabled",
         "cb_api_error_enabled", "cb_recovery_enabled",
@@ -400,9 +390,6 @@ def update_settings(data: dict) -> BotSettings:
         except (ValueError, TypeError) as e:
             log.warning("settings: skip %s=%r (%s)", k, v, e)
     s.market_5m_enabled = True
-    s.market_15m_enabled = False
-    s.arb5_enabled = False
-    s.arb15_enabled = False
     for i in range(1, 7):
         time_min_secs = float(getattr(s, f"time{i}_min_secs_left"))
         time_max_secs = float(getattr(s, f"time{i}_max_secs_left"))

@@ -452,7 +452,7 @@ const COL={
 const RISK_E={safest:'[safe]',safe:'[safe]',medium:'[med]',high:'[high]',highest:'[!!]'};
 let calendarDate=new Date();
 let calendarDays=[];
-let focusedCalendarDate='';
+let focusedCalendarDate=calendarDate.getFullYear()+'-'+String(calendarDate.getMonth()+1).padStart(2,'0')+'-'+String(calendarDate.getDate()).padStart(2,'0');
 
 function toggleTimeTrigger(trigger,enabled){
   const key=trigger==='BUY-1'?'buy1_enabled':'time'+trigger.split('-')[1]+'_enabled';

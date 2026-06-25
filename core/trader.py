@@ -4,8 +4,8 @@ trader.py — Order execution via py-clob-client-v2 (CTF Exchange V2)
 V2 migration (live since 2026-04-22). V1 SDK is dead.
 
 Live mode:
-  - BUY  → Limit FAK (Fill-and-Kill / IOC) at price + 1 tick — partial OK
-           Atomic: fully filled or rejected. No fill-polling needed.
+  - BUY  → SDK market-order path with a price cap, posted as FOK by
+           END_WINDOW so the entry is fully filled or rejected.
   - SELL → Limit GTC at max(tick, price - 1 tick)
            Polling fill status. Partial fill accepted, remainder cancelled.
 
@@ -459,7 +459,7 @@ async def _get_market_info(client, token_id: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  BUY — Limit FAK (Fill-and-Kill / IOC, partial fill allowed)
+#  BUY — SDK market order with price cap (FOK by END_WINDOW, FAK optional)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _quantize_binary_order(price: float, size: float) -> tuple[float, float]:
@@ -609,7 +609,11 @@ async def _buy_sdk_fok(client, token_id: str, outcome: str,
                         allow_partial: bool = True,
                         skip_preflight: bool = False,
                         ignore_slippage: bool = False) -> TradeResult:
-    """BUY via V2 SDK. FAK allows partial; FOK is all-or-kill."""
+    """BUY via V2 SDK market-order endpoint.
+
+    FAK allows partial fills; FOK is all-or-kill. END_WINDOW uses FOK because
+    small partial live fills can be uneconomic to unwind.
+    """
     try:
         tick = float(tick_size)
         order_type = OrderType.FAK if allow_partial else OrderType.FOK

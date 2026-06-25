@@ -146,7 +146,7 @@ def test_end_window_final_retry_never_exceeds_layer_price_cap():
         "END_WINDOW UP T6: configurable",
     ],
 )
-def test_end_window_buys_hundred_dollar_reverse_at_forty_cents_for_every_strategy(source_reason):
+def test_removed_reverse_hedge_does_not_buy_opposite_side_for_existing_strategy(source_reason):
     market = _market(
         up_ask=0.91,
         down_ask=0.40,
@@ -172,11 +172,9 @@ def test_end_window_buys_hundred_dollar_reverse_at_forty_cents_for_every_strateg
         max_trades_per_window=4,
 
     )
-    fake_record = SimpleNamespace(trigger="END_WINDOW")
-
     with (
         patch("bot_runtime.end_window_runner.st.load_trades", return_value=[initial]),
-        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock(return_value=fake_record)) as buy,
+        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock()) as buy,
     ):
         out = asyncio.run(end_window_runner.try_end_window_market(
             market=market,
@@ -188,14 +186,11 @@ def test_end_window_buys_hundred_dollar_reverse_at_forty_cents_for_every_strateg
             cfg=cfg,
         ))
 
-    assert out is fake_record
-    assert buy.await_args.kwargs["outcome"] == "DOWN"
-    assert buy.await_args.kwargs["amount_usd"] == 100.0
-    assert buy.await_args.kwargs["price"] == 0.40
-    assert "REVERSE:" in buy.await_args.kwargs["reason"]
+    assert out is None
+    buy.assert_not_awaited()
 
 
-def test_end_window_reverse_is_extra_slot_after_normal_trade_cap():
+def test_removed_reverse_hedge_does_not_use_extra_slot_after_normal_trade_cap():
     market = _market(
         up_ask=0.91,
         down_ask=0.40,
@@ -225,11 +220,9 @@ def test_end_window_reverse_is_extra_slot_after_normal_trade_cap():
         max_trades_per_window=9,
 
     )
-    fake_record = SimpleNamespace(trigger="END_WINDOW")
-
     with (
         patch("bot_runtime.end_window_runner.st.load_trades", return_value=normal_trades),
-        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock(return_value=fake_record)) as buy,
+        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock()) as buy,
     ):
         out = asyncio.run(end_window_runner.try_end_window_market(
             market=market,
@@ -241,10 +234,8 @@ def test_end_window_reverse_is_extra_slot_after_normal_trade_cap():
             cfg=cfg,
         ))
 
-    assert out is fake_record
-    assert buy.await_args.kwargs["price"] == 0.40
-    assert buy.await_args.kwargs["amount_usd"] == 100.0
-    assert buy.await_args.kwargs["strict_price"] is True
+    assert out is None
+    buy.assert_not_awaited()
 
 
 def test_end_window_does_not_buy_reverse_1_until_direction_flips():
@@ -290,7 +281,7 @@ def test_end_window_does_not_buy_reverse_1_until_direction_flips():
     buy.assert_not_awaited()
 
 
-def test_end_window_buys_reverse_1_when_direction_flips_back():
+def test_removed_reverse_hedge_does_not_buy_when_direction_flips_back():
     market = _market(
         up_ask=0.40,
         up_ask_depth=[(0.40, 1000.0)],
@@ -324,11 +315,9 @@ def test_end_window_buys_reverse_1_when_direction_flips_back():
         max_trades_per_window=4,
 
     )
-    fake_record = SimpleNamespace(trigger="END_WINDOW")
-
     with (
         patch("bot_runtime.end_window_runner.st.load_trades", return_value=[initial, reverse]),
-        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock(return_value=fake_record)) as buy,
+        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock()) as buy,
     ):
         out = asyncio.run(end_window_runner.try_end_window_market(
             market=market,
@@ -340,16 +329,11 @@ def test_end_window_buys_reverse_1_when_direction_flips_back():
             cfg=cfg,
         ))
 
-    assert out is fake_record
-    assert buy.await_args.kwargs["outcome"] == "UP"
-    assert buy.await_args.kwargs["amount_usd"] == 100.0
-    assert buy.await_args.kwargs["price"] == 0.40
-    assert "REVERSE-1:" in buy.await_args.kwargs["reason"]
-    assert "source=REVERSE" in buy.await_args.kwargs["reason"]
-    assert "source_ref=order-reverse-down" in buy.await_args.kwargs["reason"]
+    assert out is None
+    buy.assert_not_awaited()
 
 
-def test_end_window_buys_only_one_first_reverse_per_window():
+def test_removed_reverse_hedge_does_not_batch_reverse_orders_per_window():
     market = _market(
         up_ask=0.91,
         down_ask=0.40,
@@ -417,14 +401,11 @@ def test_end_window_buys_only_one_first_reverse_per_window():
             cfg=cfg,
         ))
 
-    assert len(records) == 1
-    assert buy.await_count == 1
-    assert [call.kwargs["amount_usd"] for call in buy.await_args_list] == [50.0]
-    reasons = [call.kwargs["reason"] for call in buy.await_args_list]
-    assert "source_ref=order-source-1" in reasons[0]
+    assert records == []
+    buy.assert_not_awaited()
 
 
-def test_end_window_reverse_rejects_price_above_forty_cents():
+def test_removed_reverse_hedge_ignores_above_cap_opposite_price():
     market = _market(
         up_ask=0.88,
         down_ask=0.41,
@@ -446,7 +427,6 @@ def test_end_window_reverse_rejects_price_above_forty_cents():
 
     with (
         patch("bot_runtime.end_window_runner.st.load_trades", return_value=[initial]),
-        patch("bot_runtime.end_window_runner._log_reverse_skip") as reverse_skip,
         patch("bot_runtime.end_window_runner._execute_buy", AsyncMock()) as buy,
     ):
         out = asyncio.run(end_window_runner.try_end_window_market(
@@ -461,13 +441,9 @@ def test_end_window_reverse_rejects_price_above_forty_cents():
 
     assert out is None
     buy.assert_not_awaited()
-    reverse_skip.assert_called_once_with(
-        market.slug,
-        "ask_above_cap: outcome=DOWN ask=0.4100 cap=0.4000",
-    )
 
 
-def test_end_window_buys_reverse_below_forty_cents():
+def test_removed_reverse_hedge_ignores_below_cap_opposite_price():
     market = _market(
         up_ask=0.88,
         down_ask=0.39,
@@ -487,11 +463,9 @@ def test_end_window_buys_reverse_below_forty_cents():
         "exited_early": False,
     }
     cfg = end_window.EndWindowConfig(enabled=True, max_trades_per_window=4)
-    fake_record = SimpleNamespace(trigger="END_WINDOW")
-
     with (
         patch("bot_runtime.end_window_runner.st.load_trades", return_value=[initial]),
-        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock(return_value=fake_record)) as buy,
+        patch("bot_runtime.end_window_runner._execute_buy", AsyncMock()) as buy,
     ):
         out = asyncio.run(end_window_runner.try_end_window_market(
             market=market,
@@ -503,10 +477,8 @@ def test_end_window_buys_reverse_below_forty_cents():
             cfg=cfg,
         ))
 
-    assert out is fake_record
-    assert buy.await_args.kwargs["outcome"] == "DOWN"
-    assert buy.await_args.kwargs["price"] == 0.39
-    assert "cap=0.4000" in buy.await_args.kwargs["reason"]
+    assert out is None
+    buy.assert_not_awaited()
 
 
 def test_btc_15m_market_is_ignored_after_arb_removal():
@@ -520,10 +492,6 @@ def test_btc_15m_market_is_ignored_after_arb_removal():
     )
     settings = end_window_runner.st.BotSettings(
         market_5m_enabled=False,
-        market_15m_enabled=True,
-        arb15_enabled=True,
-        arb15_price=0.43,
-        arb15_trade_usd=100.0,
     )
     with (
         patch("bot_runtime.end_window_runner.st.load_trades", return_value=[]),
@@ -543,7 +511,7 @@ def test_btc_15m_market_is_ignored_after_arb_removal():
     buy.assert_not_awaited()
 
 
-def test_btc_5m_arb_settings_do_not_fire_arbitrage():
+def test_btc_5m_removed_arb_settings_do_not_fire_arbitrage():
     market = _market(
         close_ts=1800000300,
         up_ask=0.43,
@@ -553,10 +521,6 @@ def test_btc_5m_arb_settings_do_not_fire_arbitrage():
     )
     settings = end_window_runner.st.BotSettings(
         market_5m_enabled=True,
-        market_15m_enabled=False,
-        arb5_enabled=True,
-        arb5_price=0.43,
-        arb5_trade_usd=100.0,
         time1_enabled=False,
         time2_enabled=False,
         time3_enabled=False,
@@ -583,7 +547,7 @@ def test_btc_5m_arb_settings_do_not_fire_arbitrage():
     buy.assert_not_awaited()
 
 
-def test_btc_5m_arb_settings_fall_through_to_time():
+def test_removed_arb_settings_fall_through_to_time():
     market = _market(
         close_ts=1800000300,
         up_ask=0.90,
@@ -593,10 +557,6 @@ def test_btc_5m_arb_settings_fall_through_to_time():
     )
     settings = end_window_runner.st.BotSettings(
         market_5m_enabled=True,
-        market_15m_enabled=False,
-        arb5_enabled=True,
-        arb5_price=0.43,
-        arb5_trade_usd=100.0,
         time1_enabled=True,
         time1_price=0.90,
         time1_trade_usd=100.0,
@@ -652,10 +612,6 @@ def test_legacy_arb_leg_does_not_block_time_after_arb_removal():
     }
     settings = end_window_runner.st.BotSettings(
         market_5m_enabled=True,
-        market_15m_enabled=False,
-        arb5_enabled=True,
-        arb5_price=0.43,
-        arb5_trade_usd=100.0,
         time1_enabled=True,
         time1_price=0.90,
         time1_trade_usd=100.0,

@@ -851,13 +851,13 @@ input,select{width:100%;border:1px solid var(--line);background:#0b111c;color:va
           <section class="settings-section">
             <h3>A. Trading Settings</h3>
             <div class="form-row"><div><span class="label">BTC 5m</span><label class="switch" aria-label="BTC 5m"><input id="market5m" type="checkbox" checked disabled><span class="slider"></span></label></div></div>
-            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label><label><span class="label">Profit Stop %</span><input id="profitStopPct" type="number" min="1" step="1" value="100"></label></div>
+            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label><label><span class="label">Profit Stop %</span><input id="profitStopPct" type="number" min="1" step="1" value="100"></label><label><span class="label">Daily Profit Stop %</span><input id="dailyProfitStopPct" type="number" min="0" step="1" value="40"></label></div>
             <div class="form-row"><label><span class="label">Order type</span><input id="orderType" value="FOK" disabled></label><label><span class="label">Max buy price</span><input id="maxBuyPrice" value="N/A" disabled></label></div>
             <button onclick="saveSettings()">Save Trading Settings</button>
           </section>
           <section class="settings-section">
             <h3>B. Risk Settings</h3>
-            <div class="form-row"><label><span class="label">Risk/trade</span><input id="riskTrade" value="N/A" disabled></label><label><span class="label">Max daily loss</span><input id="maxDailyLoss" value="N/A" disabled></label></div>
+            <div class="form-row"><label><span class="label">Risk/trade</span><input id="riskTrade" value="N/A" disabled></label><label><span class="label">Max daily loss</span><input id="maxDailyLoss" value="N/A" disabled></label><label><span class="label">Daily profit target</span><input id="dailyProfitTarget" value="N/A" disabled></label><label><span class="label">Daily halt</span><input id="dailyHaltStatus" value="N/A" disabled></label></div>
             <div class="form-row"><label><span class="label">Max loss streak</span><input id="maxLossStreak" value="N/A" disabled></label><label><span class="label">Emergency</span><input id="emergencyStatus" value="N/A" disabled></label></div>
           </section>
           <section class="settings-section">
@@ -946,9 +946,10 @@ async function saveSettings(){
  try{
   const body={
    market_5m_enabled:true,
-   trade_amount:Number($('tradeAmount').value||0),
-   max_trades_per_window:Number($('maxTrades').value||1),
-   profit_stop_pct:Number($('profitStopPct').value||100)
+    trade_amount:Number($('tradeAmount').value||0),
+    max_trades_per_window:Number($('maxTrades').value||1),
+    profit_stop_pct:Number($('profitStopPct').value||100),
+    daily_profit_stop_pct:Number($('dailyProfitStopPct').value||0)
   };
   await post('/api/settings', body); $('settingsSaved').textContent='Saved'; toast('Settings saved');
  }catch(e){toast(e.message)}
@@ -1090,7 +1091,7 @@ function deriveDecision(s){
  else if(secs>maxLayerSeconds){decision='WAIT';reason='Outside end-window';}
  else if(secs<=4){decision='NO_TRADE';reason='Retry disabled below 4s';}
  else if(!active){decision='NO_TRADE';reason='No active layer';}
- else if(!riskOk){decision='NO_TRADE';reason=s.daily_halted?'Daily halt active':'Circuit breaker active';}
+ else if(!riskOk){decision='NO_TRADE';reason=s.daily_halted?(s.daily_halt_reason||'Daily halt active'):'Circuit breaker active';}
  else if(!windowCapOk){decision='NO_TRADE';reason='Max trades per window reached';}
  else if(!layerSlotOk){decision='NO_TRADE';reason='T1-T6 slot already used in this window';}
  else if(!balanceOk){decision='NO_TRADE';reason='Balance below trade size';}
@@ -1155,7 +1156,7 @@ function renderDecisionChecklist(d){
 function renderTopBar(s,d){
  const running=d.running;
  $('runDot').className='dot '+(running?'on':'off');
- $('runText').textContent=running?'RUNNING':(!d.stateFresh&&s.trading_enabled?'STALE':'STOPPED');
+ $('runText').textContent=running?'RUNNING':(s.daily_halted?'DAILY HALT':(!d.stateFresh&&s.trading_enabled?'STALE':'STOPPED'));
  setBadge('modeBadge', s.mock_mode?'MOCK':'LIVE', s.mock_mode?'mock':'live');
  $('market').textContent=val(s.market_question||s.current_window||s.market_slug);
  $('updated').textContent='Last updated '+fmtTime(s.last_update);
@@ -1498,9 +1499,10 @@ function renderState(s){
  }
  const settings=s.end_window_settings||{}, active=s.active_settings||{};
  if(document.activeElement!==$('market5m'))$('market5m').checked=settings.market_5m_enabled!==false;
- if(document.activeElement!==$('tradeAmount'))$('tradeAmount').value=Number(settings.trade_usd||active.trade_amount||100).toFixed(0);
- if(document.activeElement!==$('maxTrades'))$('maxTrades').value=Number(settings.max_trades_per_window||active.max_trades_per_window||1);
- if(document.activeElement!==$('profitStopPct'))$('profitStopPct').value=Number(active.profit_stop_pct||100).toFixed(0);
+  if(document.activeElement!==$('tradeAmount'))$('tradeAmount').value=Number(settings.trade_usd||active.trade_amount||100).toFixed(0);
+  if(document.activeElement!==$('maxTrades'))$('maxTrades').value=Number(settings.max_trades_per_window||active.max_trades_per_window||1);
+  if(document.activeElement!==$('profitStopPct'))$('profitStopPct').value=Number(active.profit_stop_pct||100).toFixed(0);
+  if(document.activeElement!==$('dailyProfitStopPct'))$('dailyProfitStopPct').value=Number(active.daily_profit_stop_pct||40).toFixed(0);
  $('orderType').value=settings.order_type||'FOK';
  $('maxBuyPrice').value=d.maxPrice?num(d.maxPrice,2):'N/A';
  $('maxSpreadSetting').value=settings.max_spread!==undefined?num(settings.max_spread,3):'N/A';
@@ -1510,6 +1512,8 @@ function renderState(s){
  const noLossCap=s.mock_mode&&active.cb_master_enabled===false;
  $('riskTrade').value=noLossCap?'No cap (mock)':active.max_loss_per_trade?money(active.max_loss_per_trade):'N/A';
  $('maxDailyLoss').value=noLossCap?'No cap (mock)':active.max_daily_loss?money(active.max_daily_loss):'N/A';
+ $('dailyProfitTarget').value=Number(s.daily_profit_stop_amount||0)>0?`${money(s.daily_profit_stop_amount)} (${num(s.daily_profit_stop_pct||active.daily_profit_stop_pct||0,0)}%)`:'Disabled';
+ $('dailyHaltStatus').value=s.daily_halted?(s.daily_halt_reason||'active'):'clear';
  $('maxLossStreak').value=noLossCap?'No cap':active.max_consecutive_losses||'N/A';
  $('emergencyStatus').value=s.emergency_stop?'ACTIVE':'clear';
  const raw=(s.log_lines||[]).slice(-12).reverse();
@@ -1634,6 +1638,7 @@ async def api_settings_post(request: web.Request) -> web.Response:
             or key.startswith("buy1_")
             or key == "market_5m_enabled"
             or key == "profit_stop_pct"
+            or key == "daily_profit_stop_pct"
         )
     }
     try:

@@ -224,9 +224,9 @@ class BotSettings:
     force_exit_secs: float       = 15.0
     max_session_loss: float      = 50.0
     max_consecutive_losses: int  = 5
-    # ── Daily loss circuit breaker (lebih ketat dari session_loss) ────────
-    # Reset setiap UTC midnight. Halt trading kalau daily DD exceeded.
+    # ── Daily circuit breakers (reset setiap UTC midnight) ────────────────
     max_daily_loss: float        = 20.0
+    daily_profit_stop_pct: float = 40.0
     # ── Recovery mode (informational only — tidak ada sizing scale-down):
     # entered setelah X consecutive losses, exited setelah Y wins.
     # Tetap di-track untuk dashboard awareness, tapi tidak ubah trade_amount.
@@ -345,6 +345,7 @@ def update_settings(data: dict) -> BotSettings:
         "max_session_loss":      (5.0, 10000.0),
         "max_consecutive_losses":(2, 50),
         "max_daily_loss":        (1.0, 10000.0),
+        "daily_profit_stop_pct": (0.0, 10000.0),
         "recovery_after_losses": (2, 20),
         "recovery_size_pct":     (0.1, 1.0),
         "recovery_exit_wins":    (1, 10),
@@ -486,9 +487,22 @@ def load_daily_pnl() -> dict:
     data = _safe_read_json(DAILY_PNL_FILE)
     today = _today_utc()
     if not data or not isinstance(data, dict) or data.get("date") != today:
+        start_balance = float(load_balance().get("balance", 0.0) or 0.0)
         data = {"date": today, "pnl": 0.0, "trades": 0,
-                "wins": 0, "losses": 0, "halted": False}
+                "wins": 0, "losses": 0, "halted": False,
+                "halt_reason": "", "start_balance": start_balance}
         _atomic_write(DAILY_PNL_FILE, json.dumps(data, indent=2))
+    else:
+        changed = False
+        if "start_balance" not in data:
+            current_balance = float(load_balance().get("balance", 0.0) or 0.0)
+            data["start_balance"] = round(current_balance - float(data.get("pnl") or 0.0), 4)
+            changed = True
+        if "halt_reason" not in data:
+            data["halt_reason"] = ""
+            changed = True
+        if changed:
+            _atomic_write(DAILY_PNL_FILE, json.dumps(data, indent=2))
     return data
 
 
@@ -505,9 +519,10 @@ def update_daily_pnl(pnl: float, won: Optional[bool]) -> dict:
     return data
 
 
-def set_daily_halted(halted: bool):
+def set_daily_halted(halted: bool, reason: str = ""):
     data = load_daily_pnl()
     data["halted"] = halted
+    data["halt_reason"] = reason if halted else ""
     _atomic_write(DAILY_PNL_FILE, json.dumps(data, indent=2))
 
 
@@ -698,8 +713,11 @@ class BotState:
     # ── Risk metrics (8/10 readiness) ───────────────────────────────────
     daily_pnl: float = 0.0          # today's PnL (UTC-reset at midnight)
     daily_trades: int = 0           # today's trade count
-    daily_halted: bool = False      # True if max_daily_loss reached
+    daily_halted: bool = False      # True if daily loss/profit stop reached
     daily_halt_reason: str = ""
+    daily_start_balance: float = 0.0
+    daily_profit_stop_pct: float = 0.0
+    daily_profit_stop_amount: float = 0.0
     in_recovery: bool = False       # post-loss-streak (informational)
     recovery_streak_wins: int = 0   # consecutive wins towards exit recovery
     api_error_rate: float = 0.0     # rolling % API errors (last 50 calls)
@@ -827,11 +845,16 @@ def rebuild_daily_pnl(trades: list[dict] | None = None) -> dict:
     """Rebuild today's daily PnL from resolved trades after corrections."""
     trades = trades if trades is not None else load_trades()
     today = _today_utc()
-    data = {"date": today, "pnl": 0.0, "trades": 0,
-            "wins": 0, "losses": 0, "halted": False}
     old = _safe_read_json(DAILY_PNL_FILE)
+    start_balance = float(load_balance().get("balance", 0.0) or 0.0)
+    if isinstance(old, dict) and old.get("date") == today:
+        start_balance = float(old.get("start_balance", start_balance) or 0.0)
+    data = {"date": today, "pnl": 0.0, "trades": 0,
+            "wins": 0, "losses": 0, "halted": False,
+            "halt_reason": "", "start_balance": start_balance}
     if isinstance(old, dict) and old.get("date") == today:
         data["halted"] = bool(old.get("halted", False))
+        data["halt_reason"] = str(old.get("halt_reason", "") or "")
     for t in trades:
         if not t.get("resolved"):
             continue

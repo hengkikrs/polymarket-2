@@ -115,6 +115,7 @@ class Bot:
         trades = st.load_trades()
         stats = st.calc_stats(trades)
         bal = st.load_balance()
+        cfg = self._load_cfg()
         self.state.balance = float(bal.get("balance", 0.0) or 0.0)
         self.state.initial_balance = float(bal.get("initial", 0.0) or 0.0)
         self.state.trades_total = int(stats.get("trades_total", 0) or 0)
@@ -128,12 +129,47 @@ class Bot:
         self.state.daily_pnl = float(daily.get("pnl", 0.0) or 0.0)
         self.state.daily_trades = int(daily.get("trades", 0) or 0)
         self.state.daily_halted = bool(daily.get("halted", False))
+        self.state.daily_halt_reason = str(daily.get("halt_reason", "") or "")
+        self.state.daily_start_balance = float(daily.get("start_balance", 0.0) or 0.0)
+        self.state.daily_profit_stop_pct = float(getattr(cfg, "daily_profit_stop_pct", 0.0) or 0.0)
+        self.state.daily_profit_stop_amount = self._daily_profit_stop_amount(cfg, daily)
         if config.MOCK_MODE:
             ledger = st.calc_trade_ledger_balance(trades, bal)
             self.state.ledger_balance = ledger["ledger_balance"]
             self.state.ledger_balance_drift = ledger["ledger_balance_drift"]
             self.state.ledger_balance_ok = ledger["ledger_balance_ok"]
         self._update_open_legs(trades)
+
+    @staticmethod
+    def _daily_profit_stop_amount(cfg: st.BotSettings, daily: dict) -> float:
+        pct = float(getattr(cfg, "daily_profit_stop_pct", 0.0) or 0.0)
+        start_balance = float(daily.get("start_balance", 0.0) or 0.0)
+        if pct <= 0 or start_balance <= 0:
+            return 0.0
+        return round(start_balance * pct / 100.0, 4)
+
+    def _apply_daily_profit_halt(self, cfg: st.BotSettings | None = None) -> bool:
+        cfg = cfg or self._load_cfg()
+        daily = st.load_daily_pnl()
+        stop_amount = self._daily_profit_stop_amount(cfg, daily)
+        daily_pnl = float(daily.get("pnl", 0.0) or 0.0)
+        if stop_amount <= 0 or daily_pnl < stop_amount:
+            return False
+
+        reason = (
+            f"Daily profit target reached: ${daily_pnl:.2f} "
+            f">= ${stop_amount:.2f} ({float(cfg.daily_profit_stop_pct):.1f}% of "
+            f"${float(daily.get('start_balance', 0.0) or 0.0):.2f})"
+        )
+        if not bool(daily.get("halted", False)) or daily.get("halt_reason") != reason:
+            log.info("%s. Pausing entries until next UTC day.", reason)
+            st.set_daily_halted(True, reason)
+            asyncio.create_task(tg.send(f"⚠️ **DAILY PROFIT STOP**\n{reason}\nBot will resume on the next UTC day."))
+        self.state.trading_enabled = False
+        self.state.status = self.state.bot_status = "daily_profit_stop"
+        self._sync_stats()
+        self._save(force=True)
+        return True
 
     def _update_open_legs(self, trades: list[dict] | None = None) -> None:
         trades = trades if trades is not None else st.load_trades()
@@ -550,6 +586,7 @@ class Bot:
         self._save(force=True)
 
         cfg = st.load_settings()
+        self._apply_daily_profit_halt(cfg)
         window_budget = cfg.trade_amount * cfg.max_trades_per_window
         profit_limit = window_budget * (cfg.profit_stop_pct / 100.0)
         
@@ -762,6 +799,10 @@ class Bot:
                     self._sync_stats()
                     self._save()
                     await asyncio.sleep(1.0)
+                    continue
+
+                if self._apply_daily_profit_halt():
+                    await asyncio.sleep(30.0)
                     continue
 
                 self.state.trading_enabled = True

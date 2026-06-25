@@ -1745,6 +1745,55 @@ def test_apply_safety_gate_blocks_trading_loudly():
     save_state.assert_called_once_with(force=True)
 
 
+def test_daily_profit_halt_pauses_entries_until_next_day():
+    async def run_check():
+        bot = Bot.__new__(Bot)
+        bot.state = SimpleNamespace(trading_enabled=True)
+        cfg = SimpleNamespace(daily_profit_stop_pct=40.0)
+        daily = {"pnl": 82.0, "start_balance": 200.0, "halted": False, "halt_reason": ""}
+
+        with (
+            patch("bot_runtime.app.st.load_daily_pnl", return_value=daily),
+            patch("bot_runtime.app.st.set_daily_halted") as set_halted,
+            patch.object(bot, "_sync_stats") as sync_stats,
+            patch.object(bot, "_save") as save_state,
+            patch("bot_runtime.app.tg.send", AsyncMock()) as send_notification,
+        ):
+            halted = bot._apply_daily_profit_halt(cfg)
+            await asyncio.sleep(0)
+
+        assert halted is True
+        assert bot.state.trading_enabled is False
+        assert bot.state.status == "daily_profit_stop"
+        set_halted.assert_called_once()
+        assert "Daily profit target reached" in set_halted.call_args.args[1]
+        sync_stats.assert_called_once()
+        save_state.assert_called_once_with(force=True)
+        send_notification.assert_awaited_once()
+
+    asyncio.run(run_check())
+
+
+def test_daily_profit_halt_ignores_below_threshold():
+    bot = Bot.__new__(Bot)
+    bot.state = SimpleNamespace(trading_enabled=True)
+    cfg = SimpleNamespace(daily_profit_stop_pct=40.0)
+    daily = {"pnl": 79.99, "start_balance": 200.0, "halted": False, "halt_reason": ""}
+
+    with (
+        patch("bot_runtime.app.st.load_daily_pnl", return_value=daily),
+        patch("bot_runtime.app.st.set_daily_halted") as set_halted,
+        patch.object(bot, "_sync_stats") as sync_stats,
+        patch.object(bot, "_save") as save_state,
+    ):
+        halted = bot._apply_daily_profit_halt(cfg)
+
+    assert halted is False
+    set_halted.assert_not_called()
+    sync_stats.assert_not_called()
+    save_state.assert_not_called()
+
+
 def test_live_final_force_attempt_keeps_preflight_enabled():
     market = _market(
         close_ts=int(time.time()) + 8,

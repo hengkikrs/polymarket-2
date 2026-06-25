@@ -111,6 +111,31 @@ class Bot:
         self._save(force=True)
         return False
 
+    def _stop_trading(self, status: str, reason: str) -> None:
+        log.info("%s", reason)
+        st.set_trading_enabled(False)
+        self.state.trading_enabled = False
+        self.state.status = self.state.bot_status = status
+        self._sync_stats()
+        self.state.trading_enabled = False
+        self._save(force=True)
+
+    def _enforce_profit_stop(self, cfg: st.BotSettings, source: str) -> bool:
+        limit = float(getattr(cfg, "profit_stop_usd", 0.0) or 0.0)
+        if limit <= 0:
+            return False
+        total_pnl = float(getattr(self.state, "total_pnl", 0.0) or 0.0)
+        session_pnl = float(getattr(self.state, "session_pnl", getattr(self, "_session_pnl", 0.0)) or 0.0)
+        stop_pnl = max(total_pnl, session_pnl)
+        if stop_pnl < limit:
+            return False
+        reason = (
+            f"Profit stop reached ({source}): total/session pnl=${stop_pnl:.2f} "
+            f"(>= ${limit:.2f}). Stopping bot."
+        )
+        self._stop_trading("profit_stop", reason)
+        return True
+
     def _sync_stats(self) -> None:
         trades = st.load_trades()
         stats = st.calc_stats(trades)
@@ -586,17 +611,17 @@ class Bot:
         self._save(force=True)
 
         cfg = st.load_settings()
-        self._apply_daily_profit_halt(cfg)
+        daily_stopped = self._apply_daily_profit_halt(cfg)
+        profit_stopped = self._enforce_profit_stop(cfg, f"window {window_ts}")
         window_budget = cfg.trade_amount * cfg.max_trades_per_window
         profit_limit = window_budget * (cfg.profit_stop_pct / 100.0)
         
-        if total_pnl >= profit_limit and profit_limit > 0:
-            log.info("Target profit reached for window %d: $%.2f (>= $%.2f). Stopping bot.", window_ts, total_pnl, profit_limit)
-            self.state.trading_enabled = False
-            self.state.status = self.state.bot_status = "waiting"
-            st.set_trading_enabled(False)
-            self._sync_stats()
-            self._save(force=True)
+        if not daily_stopped and not profit_stopped and total_pnl >= profit_limit and profit_limit > 0:
+            self._stop_trading(
+                "profit_stop",
+                f"Window profit stop reached for window {window_ts}: ${total_pnl:.2f} "
+                f"(>= ${profit_limit:.2f}). Stopping bot.",
+            )
             asyncio.create_task(tg.send(f"⚠️ **BOT STOPPED**\nTarget profit reached: +${total_pnl:.2f} (>= {cfg.profit_stop_pct}% of budget ${window_budget:.2f})"))
         wins = sum(1 for t in resolved if t.get("won") is True)
         losses = sum(1 for t in resolved if t.get("won") is False)
@@ -806,6 +831,10 @@ class Bot:
                     continue
 
                 self.state.trading_enabled = True
+                self._sync_stats()
+                if self._enforce_profit_stop(self._load_cfg(), "runtime scan"):
+                    await asyncio.sleep(1.0)
+                    continue
                 if not self._apply_safety_gate("runtime_safety_block"):
                     await asyncio.sleep(1.0)
                     continue

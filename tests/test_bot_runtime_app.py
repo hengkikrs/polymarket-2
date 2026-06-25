@@ -1794,6 +1794,32 @@ def test_daily_profit_halt_ignores_below_threshold():
     save_state.assert_not_called()
 
 
+def test_profit_stop_usd_stops_on_cumulative_profit():
+    bot = Bot.__new__(Bot)
+    bot._session_pnl = 25.0
+    bot.state = SimpleNamespace(
+        trading_enabled=True,
+        status="scanning",
+        bot_status="scanning",
+        total_pnl=1000.01,
+        session_pnl=25.0,
+    )
+
+    with (
+        patch("bot_runtime.app.st.set_trading_enabled") as set_trading,
+        patch.object(bot, "_sync_stats"),
+        patch.object(bot, "_save") as save_state,
+    ):
+        stopped = bot._enforce_profit_stop(SimpleNamespace(profit_stop_usd=1000.0), "test")
+
+    assert stopped is True
+    assert bot.state.trading_enabled is False
+    assert bot.state.status == "profit_stop"
+    assert bot.state.bot_status == "profit_stop"
+    set_trading.assert_called_once_with(False)
+    save_state.assert_called_once_with(force=True)
+
+
 def test_live_final_force_attempt_keeps_preflight_enabled():
     market = _market(
         close_ts=int(time.time()) + 8,
@@ -1985,6 +2011,67 @@ def test_directional_resolver_prefers_gamma_metadata_resolution():
     send_notification.assert_awaited_once()
     assert "Trading result:" in send_notification.await_args.args[0]
     assert "30m Saturation 0.94: 106.3s" in send_notification.await_args.args[0]
+
+
+def test_directional_resolver_stops_when_cumulative_profit_reaches_usd_limit():
+    bot = Bot.__new__(Bot)
+    bot.state = SimpleNamespace(
+        balance=0.0,
+        session_pnl=999.0,
+        total_pnl=999.0,
+        trading_enabled=True,
+        status="scanning",
+        bot_status="scanning",
+    )
+    bot._session_pnl = 999.0
+    bot._close_btc = {}
+    bot._last_save_state = 0.0
+    window_ts = 1800000000
+    trades = [
+        {
+            "window_ts": window_ts,
+            "trigger": "END_WINDOW",
+            "asset": "BTC",
+            "market_slug": "btc-updown-5m-1800000000",
+            "resolved": False,
+            "exited_early": False,
+        }
+    ]
+    resolved = [{"balance_returned": 2.0, "pnl": 1.5, "won": True}]
+
+    with (
+        patch("bot_runtime.app.time.time", return_value=window_ts + 301),
+        patch("bot_runtime.app.st.load_trades", return_value=trades),
+        patch.object(bot, "_fetch_gamma_resolution", AsyncMock(return_value={
+            "actual": "DOWN",
+            "final_price": 90.0,
+            "price_to_beat": 100.0,
+            "source": "gamma_event_metadata",
+        })),
+        patch.object(bot, "_fetch_window_close_btc", AsyncMock(return_value=110.0)),
+        patch("bot_runtime.app.st.update_directional_results", return_value=resolved),
+        patch("bot_runtime.app.st.add_balance"),
+        patch("bot_runtime.app.st.update_daily_pnl"),
+        patch("bot_runtime.app.st.load_settings", return_value=SimpleNamespace(
+            profit_stop_usd=1000.0,
+            trade_amount=100.0,
+            max_trades_per_window=9,
+            profit_stop_pct=100.0,
+        )),
+        patch("bot_runtime.app.st.set_trading_enabled") as set_trading,
+        patch.object(bot, "_sync_stats"),
+        patch.object(bot, "_save"),
+        patch("bot_runtime.app.st.load_snapshots", return_value=[]),
+        patch("bot_runtime.app.analyze_market_context", return_value={}),
+        patch("bot_runtime.app.tg.send", AsyncMock()),
+    ):
+        out = asyncio.run(bot._resolve_directional_window(SimpleNamespace(), window_ts))
+
+    assert out == resolved
+    assert bot.state.session_pnl == 1000.5
+    assert bot.state.trading_enabled is False
+    assert bot.state.status == "profit_stop"
+    set_trading.assert_called_once_with(False)
 
 
 def test_directional_resolver_defers_when_gamma_outcome_is_unavailable():

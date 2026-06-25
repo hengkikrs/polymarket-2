@@ -128,6 +128,7 @@ class BotSettings:
     trade_amount: float          = 100.0
     max_loss_per_trade: float    = 10.0
     profit_stop_pct: float       = 100.0
+    profit_stop_usd: float       = 1000.0
     t1_enabled: bool             = True
     t2_enabled: bool             = True
     t3_enabled: bool             = True
@@ -342,6 +343,7 @@ def update_settings(data: dict) -> BotSettings:
         "trail_activate_usd":    (0.01, 100.0),
         "trail_drop_price":      (0.005, 0.50),
         "force_exit_secs":       (3.0, 120.0),
+        "profit_stop_usd":       (0.0, 1000000.0),
         "max_session_loss":      (5.0, 10000.0),
         "max_consecutive_losses":(2, 50),
         "max_daily_loss":        (1.0, 10000.0),

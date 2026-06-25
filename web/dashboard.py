@@ -851,7 +851,8 @@ input,select{width:100%;border:1px solid var(--line);background:#0b111c;color:va
           <section class="settings-section">
             <h3>A. Trading Settings</h3>
             <div class="form-row"><div><span class="label">BTC 5m</span><label class="switch" aria-label="BTC 5m"><input id="market5m" type="checkbox" checked disabled><span class="slider"></span></label></div></div>
-            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label><label><span class="label">Profit Stop %</span><input id="profitStopPct" type="number" min="1" step="1" value="100"></label><label><span class="label">Daily Profit Stop %</span><input id="dailyProfitStopPct" type="number" min="0" step="1" value="40"></label></div>
+            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label><label><span class="label">Profit Stop %</span><input id="profitStopPct" type="number" min="1" step="1" value="100"></label></div>
+            <div class="form-row"><label><span class="label">Profit Stop $</span><input id="profitStopUsd" type="number" min="0" step="1" value="1000"></label><label><span class="label">Daily Profit Stop %</span><input id="dailyProfitStopPct" type="number" min="0" step="1" value="40"></label></div>
             <div class="form-row"><label><span class="label">Order type</span><input id="orderType" value="FOK" disabled></label><label><span class="label">Max buy price</span><input id="maxBuyPrice" value="N/A" disabled></label></div>
             <button onclick="saveSettings()">Save Trading Settings</button>
           </section>
@@ -946,10 +947,11 @@ async function saveSettings(){
  try{
   const body={
    market_5m_enabled:true,
-    trade_amount:Number($('tradeAmount').value||0),
-    max_trades_per_window:Number($('maxTrades').value||1),
-    profit_stop_pct:Number($('profitStopPct').value||100),
-    daily_profit_stop_pct:Number($('dailyProfitStopPct').value||0)
+   trade_amount:Number($('tradeAmount').value||0),
+   max_trades_per_window:Number($('maxTrades').value||1),
+   profit_stop_pct:Number($('profitStopPct').value||100),
+   profit_stop_usd:Number($('profitStopUsd').value||0),
+   daily_profit_stop_pct:Number($('dailyProfitStopPct').value||0)
   };
   await post('/api/settings', body); $('settingsSaved').textContent='Saved'; toast('Settings saved');
  }catch(e){toast(e.message)}
@@ -1499,10 +1501,11 @@ function renderState(s){
  }
  const settings=s.end_window_settings||{}, active=s.active_settings||{};
  if(document.activeElement!==$('market5m'))$('market5m').checked=settings.market_5m_enabled!==false;
-  if(document.activeElement!==$('tradeAmount'))$('tradeAmount').value=Number(settings.trade_usd||active.trade_amount||100).toFixed(0);
-  if(document.activeElement!==$('maxTrades'))$('maxTrades').value=Number(settings.max_trades_per_window||active.max_trades_per_window||1);
-  if(document.activeElement!==$('profitStopPct'))$('profitStopPct').value=Number(active.profit_stop_pct||100).toFixed(0);
-  if(document.activeElement!==$('dailyProfitStopPct'))$('dailyProfitStopPct').value=Number(active.daily_profit_stop_pct||40).toFixed(0);
+ if(document.activeElement!==$('tradeAmount'))$('tradeAmount').value=Number(settings.trade_usd||active.trade_amount||100).toFixed(0);
+ if(document.activeElement!==$('maxTrades'))$('maxTrades').value=Number(settings.max_trades_per_window||active.max_trades_per_window||1);
+ if(document.activeElement!==$('profitStopPct'))$('profitStopPct').value=Number(active.profit_stop_pct||100).toFixed(0);
+ if(document.activeElement!==$('profitStopUsd'))$('profitStopUsd').value=Number(active.profit_stop_usd||1000).toFixed(0);
+ if(document.activeElement!==$('dailyProfitStopPct'))$('dailyProfitStopPct').value=Number(active.daily_profit_stop_pct||40).toFixed(0);
  $('orderType').value=settings.order_type||'FOK';
  $('maxBuyPrice').value=d.maxPrice?num(d.maxPrice,2):'N/A';
  $('maxSpreadSetting').value=settings.max_spread!==undefined?num(settings.max_spread,3):'N/A';
@@ -1639,6 +1642,7 @@ async def api_settings_post(request: web.Request) -> web.Response:
             or key == "market_5m_enabled"
             or key == "profit_stop_pct"
             or key == "daily_profit_stop_pct"
+            or key == "profit_stop_usd"
         )
     }
     try:

@@ -12,7 +12,14 @@ echo "[2/6] Backing up runtime_data..."
 bash "$APP_DIR/deploy/aws/backup_runtime.sh"
 
 echo "[3/6] Pulling latest code..."
-git pull --ff-only
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "Working tree has tracked local changes; stashing them before update."
+  git stash push -m "pre-update-$(date -u +%Y%m%dT%H%M%SZ)"
+else
+  echo "No tracked local changes to stash."
+fi
+git fetch origin main
+git merge --ff-only origin/main
 
 echo "[4/6] Updating Python dependencies..."
 source "$APP_DIR/.venv/bin/activate"

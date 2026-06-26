@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import core.state as st
+import web.dashboard as dash
 from web.dashboard import (
     _build_pnl_calendar,
     _end_window_settings,
@@ -12,7 +13,9 @@ from web.dashboard import (
     _pnl_history,
     _price_extreme_stats,
     _recent_trades,
+    _state_payload,
     _trade_fire_layer,
+    api_control,
     api_health,
     api_settings_post,
     index,
@@ -29,6 +32,18 @@ def _cell(calendar_data: dict, date_key: str) -> dict:
             if day["date"] == date_key:
                 return day
     raise AssertionError(f"missing calendar cell {date_key}")
+
+
+def _empty_stats() -> dict:
+    return {
+        "trades_total": 0,
+        "wins": 0,
+        "losses": 0,
+        "total_pnl": 0.0,
+        "win_rate": 0.0,
+        "total_wagered": 0.0,
+        "recent_win_rate": 0.0,
+    }
 
 
 def test_pnl_calendar_groups_resolved_pnl_by_day_and_ignores_open_trades():
@@ -248,6 +263,8 @@ def test_health_endpoint_exposes_non_secret_runtime_status():
         patch("web.dashboard.st.load_state", return_value={"last_update": 123.0, "current_window": 456}),
         patch("web.dashboard.st.get_trading_enabled", return_value=True),
         patch("web.dashboard.st.get_emergency_stop", return_value=False),
+        patch("web.dashboard.config.FUNDER", ""),
+        patch("web.dashboard.config.PRIVATE_KEY", "0x" + "1".zfill(64)),
     ):
         response = asyncio.run(api_health(None))
 
@@ -256,7 +273,9 @@ def test_health_endpoint_exposes_non_secret_runtime_status():
     assert data["service"] == "poly-v3-dashboard"
     assert data["trading_enabled"] is True
     assert data["emergency_stop"] is False
+    assert data["polymarket_account"].startswith("0x")
     assert "POLYMARKET_PRIVATE_KEY" not in response.text
+    assert "0000000000000000000000000000000000000000000000000000000000000001" not in response.text
 
 
 def test_removed_market_settings_are_ignored(tmp_path, monkeypatch):
@@ -279,7 +298,7 @@ def test_settings_post_syncs_market_choice_to_active_state(tmp_path, monkeypatch
     st.save_state(st.BotState(active_settings=st.asdict(st.BotSettings())))
 
     async def _json():
-        return {"market_15m_enabled": True}
+        return {"market_15m_enabled": True, "daily_profit_stop_usd": 500.0}
 
     request = SimpleNamespace(headers={}, rel_url=SimpleNamespace(query={}), json=_json)
     response = asyncio.run(api_settings_post(request))
@@ -288,10 +307,173 @@ def test_settings_post_syncs_market_choice_to_active_state(tmp_path, monkeypatch
 
     assert payload["success"] is True
     assert "market_15m_enabled" not in payload["settings"]
+    assert payload["settings"]["daily_profit_stop_usd"] == 500.0
+    assert payload["state"]["saved_settings"]["daily_profit_stop_usd"] == 500.0
+    assert payload["state"]["daily_profit_stop_usd"] == 500.0
     assert "market_15m_enabled" not in state_data["active_settings"]
+    assert state_data["active_settings"]["daily_profit_stop_usd"] == 500.0
     assert state_data["active_settings"]["market_5m_enabled"] is True
     assert state_data["market_interval_label"] == "5m"
     assert state_data["market_interval_secs"] == 300
+
+
+def test_settings_post_persists_mock_mode_to_env(tmp_path, monkeypatch):
+    settings_file = tmp_path / "settings.json"
+    state_file = tmp_path / "state.json"
+    env_file = tmp_path / ".env"
+    env_file.write_text("MOCK_MODE=true\n", encoding="utf-8")
+    monkeypatch.setattr(st, "SETTINGS_FILE", settings_file)
+    monkeypatch.setattr(st, "STATE_FILE", state_file)
+    monkeypatch.setattr(dash, "ENV_FILE", env_file)
+    monkeypatch.setenv("MOCK_MODE", "true")
+    st.save_state(st.BotState(active_settings=st.asdict(st.BotSettings())))
+
+    async def _json():
+        return {"mock_mode": False}
+
+    request = SimpleNamespace(headers={}, rel_url=SimpleNamespace(query={}), json=_json)
+    with patch("web.dashboard.config.MOCK_MODE", True):
+        response = asyncio.run(api_settings_post(request))
+    payload = json.loads(response.text)
+
+    assert payload["success"] is True
+    assert payload["restart_required"] is True
+    assert payload["settings"]["mock_mode_configured"] is False
+    assert "MOCK_MODE=false" in env_file.read_text(encoding="utf-8")
+
+
+def test_state_payload_uses_saved_daily_profit_stop_not_active_window():
+    saved = st.BotSettings(daily_profit_stop_usd=500.0)
+    active = st.BotSettings(daily_profit_stop_usd=1000.0)
+    state = {
+        "current_window": 1800000000,
+        "seconds_left": 120.0,
+        "active_settings": st.asdict(active),
+    }
+
+    with (
+        patch("web.dashboard.st.load_state", return_value=state),
+        patch("web.dashboard.st.load_daily_pnl", return_value={
+            "pnl": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "halted": False,
+            "halt_reason": "",
+            "start_balance": 1000.0,
+        }),
+        patch("web.dashboard.st.load_settings", return_value=saved),
+        patch("web.dashboard.st.load_snapshots", return_value=[]),
+        patch("web.dashboard.st.load_trades", return_value=[]),
+        patch("web.dashboard.st.load_balance", return_value={"balance": 1000.0, "initial": 1000.0}),
+        patch("web.dashboard.st.calc_stats", return_value={
+            "trades_total": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0.0,
+            "win_rate": 0.0,
+            "total_wagered": 0.0,
+            "recent_win_rate": 0.0,
+        }),
+        patch("web.dashboard.st.get_trading_enabled", return_value=True),
+        patch("web.dashboard.st.get_emergency_stop", return_value=False),
+        patch("web.dashboard.st.load_price_extremes", return_value={}),
+        patch("web.dashboard.st._atomic_write"),
+        patch("web.dashboard.st._remember_json"),
+    ):
+        payload = _state_payload()
+
+    assert payload["active_settings"]["daily_profit_stop_usd"] == 1000.0
+    assert payload["saved_settings"]["daily_profit_stop_usd"] == 500.0
+    assert payload["daily_profit_stop_usd"] == 500.0
+    assert payload["daily_profit_stop_amount"] == 500.0
+
+
+def test_state_payload_clears_stale_daily_halt_from_daily_store():
+    state = {
+        "daily_halted": True,
+        "daily_halt_reason": "Daily profit target reached",
+        "active_settings": st.asdict(st.BotSettings()),
+    }
+    daily = {
+        "date": "2026-06-27",
+        "pnl": 0.0,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "halted": False,
+        "halt_reason": "",
+        "start_balance": 1220.78,
+    }
+
+    with (
+        patch("web.dashboard.st.load_state", return_value=state),
+        patch("web.dashboard.st.load_daily_pnl", return_value=daily),
+        patch("web.dashboard.st.load_settings", return_value=st.BotSettings(daily_profit_stop_usd=500.0)),
+        patch("web.dashboard.st.load_snapshots", return_value=[]),
+        patch("web.dashboard.st.load_trades", return_value=[]),
+        patch("web.dashboard.st.load_balance", return_value={"balance": 1220.78, "initial": 1000.0}),
+        patch("web.dashboard.st.calc_stats", return_value=_empty_stats()),
+        patch("web.dashboard.st.get_trading_enabled", return_value=True),
+        patch("web.dashboard.st.get_emergency_stop", return_value=False),
+        patch("web.dashboard.st.load_price_extremes", return_value={}),
+        patch("web.dashboard.st._atomic_write") as write_state,
+        patch("web.dashboard.st._remember_json"),
+    ):
+        payload = _state_payload()
+
+    assert payload["daily_halted"] is False
+    assert payload["daily_halt_reason"] == ""
+    assert payload["daily_pnl"] == 0.0
+    write_state.assert_called_once()
+
+
+def test_control_start_returns_daily_halt_cleared_state():
+    state = {
+        "daily_halted": True,
+        "daily_halt_reason": "Daily profit target reached",
+        "active_settings": st.asdict(st.BotSettings()),
+    }
+    daily = {
+        "date": "2026-06-27",
+        "pnl": 0.0,
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "halted": False,
+        "halt_reason": "",
+        "start_balance": 1220.78,
+    }
+
+    async def _json():
+        return {"trading_enabled": True}
+
+    request = SimpleNamespace(headers={}, rel_url=SimpleNamespace(query={}), json=_json)
+
+    with (
+        patch("web.dashboard.st.set_trading_enabled") as set_trading,
+        patch("web.dashboard.st.set_emergency_stop") as set_emergency,
+        patch("web.dashboard.st.load_state", return_value=state),
+        patch("web.dashboard.st.load_daily_pnl", return_value=daily),
+        patch("web.dashboard.st.load_settings", return_value=st.BotSettings(daily_profit_stop_usd=500.0)),
+        patch("web.dashboard.st.load_snapshots", return_value=[]),
+        patch("web.dashboard.st.load_trades", return_value=[]),
+        patch("web.dashboard.st.load_balance", return_value={"balance": 1220.78, "initial": 1000.0}),
+        patch("web.dashboard.st.calc_stats", return_value=_empty_stats()),
+        patch("web.dashboard.st.get_trading_enabled", return_value=True),
+        patch("web.dashboard.st.get_emergency_stop", return_value=False),
+        patch("web.dashboard.st.load_price_extremes", return_value={}),
+        patch("web.dashboard.st._atomic_write"),
+        patch("web.dashboard.st._remember_json"),
+    ):
+        response = asyncio.run(api_control(request))
+
+    payload = json.loads(response.text)
+    assert payload["success"] is True
+    assert payload["state"]["daily_halted"] is False
+    assert payload["state"]["daily_halt_reason"] == ""
+    set_trading.assert_called_once_with(True)
+    set_emergency.assert_called_once_with(False)
 
 
 def test_price_extreme_stats_counts_each_level_independently():

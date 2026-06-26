@@ -120,22 +120,6 @@ class Bot:
         self.state.trading_enabled = False
         self._save(force=True)
 
-    def _enforce_profit_stop(self, cfg: st.BotSettings, source: str) -> bool:
-        limit = float(getattr(cfg, "profit_stop_usd", 0.0) or 0.0)
-        if limit <= 0:
-            return False
-        total_pnl = float(getattr(self.state, "total_pnl", 0.0) or 0.0)
-        session_pnl = float(getattr(self.state, "session_pnl", getattr(self, "_session_pnl", 0.0)) or 0.0)
-        stop_pnl = max(total_pnl, session_pnl)
-        if stop_pnl < limit:
-            return False
-        reason = (
-            f"Profit stop reached ({source}): total/session pnl=${stop_pnl:.2f} "
-            f"(>= ${limit:.2f}). Stopping bot."
-        )
-        self._stop_trading("profit_stop", reason)
-        return True
-
     def _sync_stats(self) -> None:
         trades = st.load_trades()
         stats = st.calc_stats(trades)
@@ -156,7 +140,7 @@ class Bot:
         self.state.daily_halted = bool(daily.get("halted", False))
         self.state.daily_halt_reason = str(daily.get("halt_reason", "") or "")
         self.state.daily_start_balance = float(daily.get("start_balance", 0.0) or 0.0)
-        self.state.daily_profit_stop_pct = float(getattr(cfg, "daily_profit_stop_pct", 0.0) or 0.0)
+        self.state.daily_profit_stop_usd = float(getattr(cfg, "daily_profit_stop_usd", 0.0) or 0.0)
         self.state.daily_profit_stop_amount = self._daily_profit_stop_amount(cfg, daily)
         if config.MOCK_MODE:
             ledger = st.calc_trade_ledger_balance(trades, bal)
@@ -167,11 +151,11 @@ class Bot:
 
     @staticmethod
     def _daily_profit_stop_amount(cfg: st.BotSettings, daily: dict) -> float:
-        pct = float(getattr(cfg, "daily_profit_stop_pct", 0.0) or 0.0)
-        start_balance = float(daily.get("start_balance", 0.0) or 0.0)
-        if pct <= 0 or start_balance <= 0:
+        del daily
+        amount = float(getattr(cfg, "daily_profit_stop_usd", 0.0) or 0.0)
+        if amount <= 0:
             return 0.0
-        return round(start_balance * pct / 100.0, 4)
+        return round(amount, 4)
 
     def _apply_daily_profit_halt(self, cfg: st.BotSettings | None = None) -> bool:
         cfg = cfg or self._load_cfg()
@@ -179,18 +163,18 @@ class Bot:
         stop_amount = self._daily_profit_stop_amount(cfg, daily)
         daily_pnl = float(daily.get("pnl", 0.0) or 0.0)
         if stop_amount <= 0 or daily_pnl < stop_amount:
+            if bool(daily.get("halted", False)):
+                st.set_daily_halted(False)
             return False
 
         reason = (
             f"Daily profit target reached: ${daily_pnl:.2f} "
-            f">= ${stop_amount:.2f} ({float(cfg.daily_profit_stop_pct):.1f}% of "
-            f"${float(daily.get('start_balance', 0.0) or 0.0):.2f})"
+            f">= ${stop_amount:.2f}"
         )
         if not bool(daily.get("halted", False)) or daily.get("halt_reason") != reason:
-            log.info("%s. Pausing entries until next UTC day.", reason)
+            log.info("%s. Pausing entries until next trading day.", reason)
             st.set_daily_halted(True, reason)
-            asyncio.create_task(tg.send(f"⚠️ **DAILY PROFIT STOP**\n{reason}\nBot will resume on the next UTC day."))
-        self.state.trading_enabled = False
+            asyncio.create_task(tg.send(f"⚠️ **DAILY PROFIT STOP**\n{reason}\nBot will resume on the next trading day."))
         self.state.status = self.state.bot_status = "daily_profit_stop"
         self._sync_stats()
         self._save(force=True)
@@ -611,18 +595,7 @@ class Bot:
         self._save(force=True)
 
         cfg = st.load_settings()
-        daily_stopped = self._apply_daily_profit_halt(cfg)
-        profit_stopped = self._enforce_profit_stop(cfg, f"window {window_ts}")
-        window_budget = cfg.trade_amount * cfg.max_trades_per_window
-        profit_limit = window_budget * (cfg.profit_stop_pct / 100.0)
-        
-        if not daily_stopped and not profit_stopped and total_pnl >= profit_limit and profit_limit > 0:
-            self._stop_trading(
-                "profit_stop",
-                f"Window profit stop reached for window {window_ts}: ${total_pnl:.2f} "
-                f"(>= ${profit_limit:.2f}). Stopping bot.",
-            )
-            asyncio.create_task(tg.send(f"⚠️ **BOT STOPPED**\nTarget profit reached: +${total_pnl:.2f} (>= {cfg.profit_stop_pct}% of budget ${window_budget:.2f})"))
+        self._apply_daily_profit_halt(cfg)
         wins = sum(1 for t in resolved if t.get("won") is True)
         losses = sum(1 for t in resolved if t.get("won") is False)
         log.info(
@@ -832,9 +805,6 @@ class Bot:
 
                 self.state.trading_enabled = True
                 self._sync_stats()
-                if self._enforce_profit_stop(self._load_cfg(), "runtime scan"):
-                    await asyncio.sleep(1.0)
-                    continue
                 if not self._apply_safety_gate("runtime_safety_block"):
                     await asyncio.sleep(1.0)
                     continue
@@ -919,6 +889,14 @@ class Bot:
                 break
 
             await self._resolve_closed_directional_orphans(session, window_ts)
+            if self._apply_daily_profit_halt(cfg):
+                break
+            if not st.get_trading_enabled():
+                self.state.trading_enabled = False
+                self.state.status = self.state.bot_status = "waiting"
+                self._sync_stats()
+                self._save(force=True)
+                break
             btc_now = await self._btc_now(session)
             market = await self._refresh_market(session, market, secs_left)
             # FIX #2: adopsi priceToBeat resmi begitu terbit; kunci btc_open.

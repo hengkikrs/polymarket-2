@@ -48,6 +48,48 @@ def _strategy_label() -> str:
     return "+".join(sorted(enabled)) if enabled else getattr(config, "STRATEGY_MODE", "END_WINDOW")
 
 
+def _configured_mock_mode() -> bool:
+    return str(os.getenv("MOCK_MODE", "true" if config.MOCK_MODE else "false")).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _public_polymarket_account() -> str:
+    funder = str(getattr(config, "FUNDER", "") or "").strip()
+    if funder:
+        return funder
+    private_key = str(getattr(config, "PRIVATE_KEY", "") or "").strip()
+    if not private_key:
+        return ""
+    try:
+        from eth_account import Account
+
+        return str(Account.from_key(private_key).address)
+    except Exception as exc:
+        log.warning("Unable to derive public Polymarket account address: %s", exc)
+        return ""
+
+
+def _sync_daily_state_fields(state: dict, *, persist: bool = False) -> dict:
+    daily = st.load_daily_pnl()
+    updates = {
+        "daily_pnl": float(daily.get("pnl", 0.0) or 0.0),
+        "daily_trades": int(daily.get("trades", 0) or 0),
+        "daily_wins": int(daily.get("wins", 0) or 0),
+        "daily_losses": int(daily.get("losses", 0) or 0),
+        "daily_halted": bool(daily.get("halted", False)),
+        "daily_halt_reason": str(daily.get("halt_reason", "") or ""),
+        "daily_start_balance": float(daily.get("start_balance", 0.0) or 0.0),
+    }
+    changed = any(state.get(key) != value for key, value in updates.items())
+    state.update(updates)
+    if persist and changed:
+        current = st.load_state()
+        current.update(updates)
+        current["last_update"] = time.time()
+        st._atomic_write(st.STATE_FILE, json.dumps(current, indent=2))
+        st._remember_json(st.STATE_FILE, current)
+    return daily
+
+
 def _set_env_values(updates: dict[str, str]) -> None:
     try:
         lines = ENV_FILE.read_text(encoding="utf-8-sig", errors="replace").splitlines()
@@ -511,6 +553,7 @@ def _low_price_winner_stats(trades: list[dict]) -> dict:
 
 def _state_payload() -> dict:
     state = st.load_state()
+    daily = _sync_daily_state_fields(state, persist=True)
     snapshots = st.load_snapshots()
     context_snapshots = snapshots[-STATE_CONTEXT_SNAPSHOT_LIMIT:]
     context = analyze_market_context(context_snapshots)
@@ -556,7 +599,6 @@ def _state_payload() -> dict:
     bal = st.load_balance()
     stats = st.calc_stats(trades)
     pnl_calendar = _build_pnl_calendar(trades)
-    today_pnl = pnl_calendar["today"]
     low_price_winner_stats = _low_price_winner_stats(trades)
     low_price_winner_stats["recent"] = low_price_winner_stats.get("recent", [])[:STATE_RESEARCH_LIMIT]
     state.update({
@@ -571,10 +613,15 @@ def _state_payload() -> dict:
         "losses": stats["losses"],
         "low_price_winner_stats": low_price_winner_stats,
         "total_pnl": stats["total_pnl"],
-        "daily_pnl": today_pnl["pnl"],
-        "daily_trades": today_pnl["trade_count"],
-        "daily_wins": today_pnl["wins"],
-        "daily_losses": today_pnl["losses"],
+        "daily_pnl": float(daily.get("pnl", 0.0) or 0.0),
+        "daily_trades": int(daily.get("trades", 0) or 0),
+        "daily_wins": int(daily.get("wins", 0) or 0),
+        "daily_losses": int(daily.get("losses", 0) or 0),
+        "daily_halted": bool(daily.get("halted", False)),
+        "daily_halt_reason": str(daily.get("halt_reason", "") or ""),
+        "daily_start_balance": float(daily.get("start_balance", 0.0) or 0.0),
+        "daily_profit_stop_usd": float(getattr(saved_settings, "daily_profit_stop_usd", 0.0) or 0.0),
+        "daily_profit_stop_amount": float(getattr(saved_settings, "daily_profit_stop_usd", 0.0) or 0.0),
         "win_rate": stats["win_rate"],
         "recent_trades": _recent_trades(
             trades,
@@ -588,6 +635,9 @@ def _state_payload() -> dict:
         "pnl_summary": _pnl_summary(trades, stats, bal),
         "pnl_history": _pnl_history(trades, limit=STATE_PNL_HISTORY_LIMIT),
         "pnl_calendar": pnl_calendar,
+        "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode_configured": _configured_mock_mode(),
+        "polymarket_account": _public_polymarket_account(),
         "trading_enabled": st.get_trading_enabled(),
         "emergency_stop": st.get_emergency_stop(),
     })
@@ -851,8 +901,9 @@ input,select{width:100%;border:1px solid var(--line);background:#0b111c;color:va
           <section class="settings-section">
             <h3>A. Trading Settings</h3>
             <div class="form-row"><div><span class="label">BTC 5m</span><label class="switch" aria-label="BTC 5m"><input id="market5m" type="checkbox" checked disabled><span class="slider"></span></label></div></div>
-            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label><label><span class="label">Profit Stop %</span><input id="profitStopPct" type="number" min="1" step="1" value="100"></label></div>
-            <div class="form-row"><label><span class="label">Profit Stop $</span><input id="profitStopUsd" type="number" min="0" step="1" value="1000"></label><label><span class="label">Daily Profit Stop %</span><input id="dailyProfitStopPct" type="number" min="0" step="1" value="40"></label></div>
+            <div class="form-row"><label><span class="label">Mode</span><select id="tradingMode"><option value="mock">MOCK</option><option value="live">LIVE</option></select></label><label><span class="label">Polymarket account</span><input id="polymarketAccount" value="N/A" disabled></label></div>
+            <div class="form-row"><label><span class="label">Trade USD</span><input id="tradeAmount" type="number" min="1" step="1"></label><label><span class="label">Max/window</span><input id="maxTrades" type="number" min="1" step="1"></label></div>
+            <div class="form-row"><label><span class="label">Daily Profit Stop $</span><input id="dailyProfitStopUsd" type="number" min="0" step="1" value="1000"></label></div>
             <div class="form-row"><label><span class="label">Order type</span><input id="orderType" value="FOK" disabled></label><label><span class="label">Max buy price</span><input id="maxBuyPrice" value="N/A" disabled></label></div>
             <button onclick="saveSettings()">Save Trading Settings</button>
           </section>
@@ -898,6 +949,9 @@ const TRADE_PAGE_SIZE = 100;
 const RESEARCH_PAGE_SIZE = 10;
 let layerEditorSignature = '';
 let screenWakeLock = null;
+let refreshInFlight = false;
+let settingsDraft = null;
+let settingsDraftUntil = 0;
 
 async function keepScreenAwake(){
  if(!('wakeLock' in navigator) || document.visibilityState!=='visible' || screenWakeLock)return;
@@ -934,11 +988,29 @@ function apiPct(s){const raw=Number(s.api_error_rate||0);return raw<=1?raw*100:r
 function setBadge(id, label, kind){const el=$(id); if(!el)return; el.className='badge '+(kind||''); el.innerHTML=label}
 function feedAge(s, key, fallback=null){const v=Number(s[key]); if(Number.isFinite(v)&&v>=0)return v; return fallback}
 function calendarKey(y,m){return `${Number(y)}-${String(Number(m)).padStart(2,'0')}`}
+function holdSettingsDraft(body){
+ settingsDraft={...(settingsDraft||{}),...body};
+ settingsDraftUntil=Date.now()+6000;
+}
+function draftActive(){return settingsDraft&&Date.now()<settingsDraftUntil}
+function withSettingsDraft(settings){return draftActive()?{...(settings||{}),...settingsDraft}:(settings||{})}
+function clearConfirmedDraft(saved){
+ if(!draftActive())return;
+ const remaining={};
+ Object.entries(settingsDraft||{}).forEach(([key,value])=>{
+  const savedValue=saved?.[key];
+  const same=typeof value==='number'?Number(savedValue)===Number(value):savedValue===value;
+  if(!same)remaining[key]=value;
+ });
+ settingsDraft=Object.keys(remaining).length?remaining:null;
+ settingsDraftUntil=settingsDraft?Date.now()+3000:0;
+}
 async function post(url, body={}){
  const r=await fetch(url,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
  let data={}; try{data=await r.json()}catch(_){}
  if(!r.ok || data.success===false) throw new Error(data.error||('HTTP '+r.status));
- await refresh(); return data;
+ if(data.state)renderState(data.state); else await refresh();
+ return data;
 }
 async function control(on){try{await post('/api/control',{trading_enabled:on});toast(on?'Trading started':'Trading stopped')}catch(e){toast(e.message)}}
 async function emergencyStop(){try{await post('/api/emergency-stop',{active:true});toast('Emergency stop active')}catch(e){toast(e.message)}}
@@ -949,11 +1021,13 @@ async function saveSettings(){
    market_5m_enabled:true,
    trade_amount:Number($('tradeAmount').value||0),
    max_trades_per_window:Number($('maxTrades').value||1),
-   profit_stop_pct:Number($('profitStopPct').value||100),
-   profit_stop_usd:Number($('profitStopUsd').value||0),
-   daily_profit_stop_pct:Number($('dailyProfitStopPct').value||0)
+   daily_profit_stop_usd:Number($('dailyProfitStopUsd').value||0),
+   mock_mode:$('tradingMode').value==='mock'
   };
-  await post('/api/settings', body); $('settingsSaved').textContent='Saved'; toast('Settings saved');
+  holdSettingsDraft(body);
+  const data=await post('/api/settings', body);
+  $('settingsSaved').textContent=data.restart_required?'Saved - restart required':'Saved';
+  toast(data.restart_required?'Settings saved; restart services to apply mode':'Settings saved');
  }catch(e){toast(e.message)}
 }
 async function saveLayerSettings(){
@@ -962,6 +1036,7 @@ async function saveLayerSettings(){
   document.querySelectorAll('#layerSettings [data-setting]').forEach((input)=>{
    body[input.dataset.setting]=input.type==='checkbox'?input.checked:Number(input.value);
   });
+  holdSettingsDraft(body);
   await post('/api/settings',body);
   $('settingsSaved').textContent='Queued for next window';
   toast('Strategy settings saved for next window');
@@ -971,6 +1046,7 @@ async function toggleLayer(layer, enabled){
  try{
   const timeMatch=String(layer).match(/^TIME-(\\d)$/);
   const key=timeMatch?`time${timeMatch[1]}_enabled`:`${String(layer).toLowerCase()}_enabled`;
+  holdSettingsDraft({[key]:!!enabled});
   await post('/api/settings',{[key]:!!enabled});
   toast(`${layer} ${enabled?'enabled':'disabled'}`);
  }catch(e){toast(e.message)}
@@ -1316,7 +1392,7 @@ function renderLayers(s,d){
  }).join('');
  $('layers').innerHTML=rows+`<div class="layer no-trade"><strong>&lt;${num(finalCutoff,1)}s</strong><div><div>NO TRADE</div><div class="hint">retry disabled</div></div><span class="status-pill no">${d.secs<=finalCutoff?'ACTIVE':'LOCKED'}</span></div>`;
  const savedRules=s.saved_end_window_rules||d.rules;
- const saved=s.saved_end_window_settings||d.ew;
+ const saved=withSettingsDraft(s.saved_end_window_settings||d.ew);
  const timeEditors=[1,2,3,4,5,6].map(i=>{
   const enabled=saved[`time${i}_enabled`]!==false;
   return `<div class="rule-editor"><div class="rule-head"><strong>TIME-${i}</strong><label class="switch"><input data-setting="time${i}_enabled" type="checkbox" ${enabled?'checked':''}><span class="slider"></span></label></div><div class="rule-fields time"><label>Exact price<input data-setting="time${i}_price" type="number" min="0.01" max="0.99" step="0.01" value="${num(saved[`time${i}_price`],2)}"></label><label>Buy when <= (s)<input data-setting="time${i}_max_secs_left" type="number" min="0.1" max="300" step="0.1" value="${num(saved[`time${i}_max_secs_left`]||299,1)}"></label><label>Stop below (s)<input data-setting="time${i}_min_secs_left" type="number" min="0" max="299" step="0.1" value="${num(saved[`time${i}_min_secs_left`],1)}"></label><label>Liquidity / USD<input data-setting="time${i}_trade_usd" type="number" min="1" step="1" value="${num(saved[`time${i}_trade_usd`],0)}"></label><label>Min delta $<input data-setting="time${i}_min_delta_usd" type="number" min="0" step="1" value="${num(saved[`time${i}_min_delta_usd`]||saved.time_min_delta_usd||3,1)}"></label></div></div>`;
@@ -1329,7 +1405,7 @@ function renderLayers(s,d){
  }).join('');
  const editorHtml=timeEditors+buy1Editor+layerEditors;
  const editorSignature=JSON.stringify({rules:savedRules,settings:saved});
- if(!document.querySelector('#layerSettings:focus-within')&&editorSignature!==layerEditorSignature){
+ if(!document.querySelector('#layerSettings:focus-within')&&!draftActive()&&editorSignature!==layerEditorSignature){
   $('layerSettings').innerHTML=editorHtml;
   layerEditorSignature=editorSignature;
  }
@@ -1499,13 +1575,14 @@ function renderState(s){
   calendarCache.set(key,s.pnl_calendar);
   if(key===calendarKey(calDate.getFullYear(),calDate.getMonth()+1))renderCalendar(s.pnl_calendar);
  }
- const settings=s.end_window_settings||{}, active=s.active_settings||{};
- if(document.activeElement!==$('market5m'))$('market5m').checked=settings.market_5m_enabled!==false;
- if(document.activeElement!==$('tradeAmount'))$('tradeAmount').value=Number(settings.trade_usd||active.trade_amount||100).toFixed(0);
- if(document.activeElement!==$('maxTrades'))$('maxTrades').value=Number(settings.max_trades_per_window||active.max_trades_per_window||1);
- if(document.activeElement!==$('profitStopPct'))$('profitStopPct').value=Number(active.profit_stop_pct||100).toFixed(0);
- if(document.activeElement!==$('profitStopUsd'))$('profitStopUsd').value=Number(active.profit_stop_usd||1000).toFixed(0);
- if(document.activeElement!==$('dailyProfitStopPct'))$('dailyProfitStopPct').value=Number(active.daily_profit_stop_pct||40).toFixed(0);
+ const settings=s.end_window_settings||{}, active=s.active_settings||{}, saved=withSettingsDraft(s.saved_settings||active);
+ clearConfirmedDraft({...(s.saved_settings||active),mock_mode:s.mock_mode_configured});
+ if(document.activeElement!==$('market5m'))$('market5m').checked=saved.market_5m_enabled!==false;
+ if(document.activeElement!==$('tradingMode'))$('tradingMode').value=(saved.mock_mode===false||s.mock_mode_configured===false?'live':'mock');
+ $('polymarketAccount').value=s.polymarket_account||'Not configured';
+ if(document.activeElement!==$('tradeAmount'))$('tradeAmount').value=Number(saved.trade_amount||100).toFixed(0);
+ if(document.activeElement!==$('maxTrades'))$('maxTrades').value=Number(saved.max_trades_per_window||1);
+ if(document.activeElement!==$('dailyProfitStopUsd'))$('dailyProfitStopUsd').value=Number(saved.daily_profit_stop_usd||0).toFixed(0);
  $('orderType').value=settings.order_type||'FOK';
  $('maxBuyPrice').value=d.maxPrice?num(d.maxPrice,2):'N/A';
  $('maxSpreadSetting').value=settings.max_spread!==undefined?num(settings.max_spread,3):'N/A';
@@ -1515,7 +1592,7 @@ function renderState(s){
  const noLossCap=s.mock_mode&&active.cb_master_enabled===false;
  $('riskTrade').value=noLossCap?'No cap (mock)':active.max_loss_per_trade?money(active.max_loss_per_trade):'N/A';
  $('maxDailyLoss').value=noLossCap?'No cap (mock)':active.max_daily_loss?money(active.max_daily_loss):'N/A';
- $('dailyProfitTarget').value=Number(s.daily_profit_stop_amount||0)>0?`${money(s.daily_profit_stop_amount)} (${num(s.daily_profit_stop_pct||active.daily_profit_stop_pct||0,0)}%)`:'Disabled';
+ $('dailyProfitTarget').value=Number(s.daily_profit_stop_amount||0)>0?money(s.daily_profit_stop_amount):'Disabled';
  $('dailyHaltStatus').value=s.daily_halted?(s.daily_halt_reason||'active'):'clear';
  $('maxLossStreak').value=noLossCap?'No cap':active.max_consecutive_losses||'N/A';
  $('emergencyStatus').value=s.emergency_stop?'ACTIVE':'clear';
@@ -1524,7 +1601,10 @@ function renderState(s){
 }
 
 async function refresh(){
- try{const r=await fetch('/api/state'); renderState(await r.json())}catch(e){console.error('state render error',e);toast('state error: '+e.message)}
+ if(refreshInFlight)return;
+ refreshInFlight=true;
+ try{const r=await fetch('/api/state',{cache:'no-store'}); renderState(await r.json())}catch(e){console.error('state render error',e);toast('state error: '+e.message)}
+ finally{refreshInFlight=false}
 }
 
 function renderCalendar(c){
@@ -1551,9 +1631,13 @@ async function loadCalendar(force=false){
 }
 function shiftMonth(n){calDate.setMonth(calDate.getMonth()+n);loadCalendar()}
 
-setInterval(refresh,200); refresh(); loadCalendar(); keepScreenAwake();
+setInterval(refresh,1000); refresh(); loadCalendar(); keepScreenAwake();
 </script></body></html>"""
-    return web.Response(text=html, content_type="text/html")
+    return web.Response(
+        text=html,
+        content_type="text/html",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 async def stream(_request: web.Request) -> web.StreamResponse:
@@ -1591,13 +1675,22 @@ async def api_control(request: web.Request) -> web.Response:
     st.set_trading_enabled(enabled)
     if enabled:
         st.set_emergency_stop(False)
-    return web.json_response({"success": True, "trading_enabled": enabled})
+        state = st.load_state()
+        _sync_daily_state_fields(state, persist=True)
+    return web.json_response({
+        "success": True,
+        "trading_enabled": enabled,
+        "state": _state_payload(),
+    })
 
 
 async def api_settings_get(_request: web.Request) -> web.Response:
     data = st.asdict(st.load_settings())
     data.update({
         "strategy_settings_effective": "next_window",
+        "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode_configured": _configured_mock_mode(),
+        "polymarket_account": _public_polymarket_account(),
         "end_window_trade_usd": float(os.getenv("END_WINDOW_TRADE_USD", data.get("trade_amount", 0.0))),
         "end_window_max_trades_per_window": int(float(os.getenv("END_WINDOW_MAX_TRADES_PER_WINDOW", "9"))),
     })
@@ -1610,6 +1703,8 @@ async def api_health(_request: web.Request) -> web.Response:
         "ok": True,
         "service": "poly-v3-dashboard",
         "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode_configured": _configured_mock_mode(),
+        "polymarket_account": _public_polymarket_account(),
         "trading_enabled": bool(st.get_trading_enabled()),
         "emergency_stop": bool(st.get_emergency_stop()),
         "last_update": state.get("last_update"),
@@ -1631,6 +1726,11 @@ async def api_settings_post(request: web.Request) -> web.Response:
         max_trades = min(9, max(1, int(data["max_trades_per_window"])))
         env_updates["MAX_TRADES_PER_WINDOW"] = str(max_trades)
         env_updates["END_WINDOW_MAX_TRADES_PER_WINDOW"] = str(max_trades)
+    restart_required = False
+    if "mock_mode" in data:
+        desired_mock = bool(data["mock_mode"])
+        env_updates["MOCK_MODE"] = "true" if desired_mock else "false"
+        restart_required = desired_mock != bool(config.MOCK_MODE)
     if env_updates:
         _set_env_values(env_updates)
     strategy_keys = {
@@ -1640,9 +1740,7 @@ async def api_settings_post(request: web.Request) -> web.Response:
             or key.startswith("time")
             or key.startswith("buy1_")
             or key == "market_5m_enabled"
-            or key == "profit_stop_pct"
-            or key == "daily_profit_stop_pct"
-            or key == "profit_stop_usd"
+            or key == "daily_profit_stop_usd"
         )
     }
     try:
@@ -1657,10 +1755,18 @@ async def api_settings_post(request: web.Request) -> web.Response:
     st._atomic_write(st.STATE_FILE, json.dumps(state_data, indent=2))
     st._remember_json(st.STATE_FILE, state_data)
     settings.update({
+        "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode_configured": _configured_mock_mode(),
+        "polymarket_account": _public_polymarket_account(),
         "end_window_trade_usd": float(os.getenv("END_WINDOW_TRADE_USD", settings.get("trade_amount", 0.0))),
         "end_window_max_trades_per_window": int(float(os.getenv("END_WINDOW_MAX_TRADES_PER_WINDOW", "9"))),
     })
-    return web.json_response({"success": True, "settings": settings})
+    return web.json_response({
+        "success": True,
+        "settings": settings,
+        "state": _state_payload(),
+        "restart_required": restart_required,
+    })
 
 
 async def api_deposit(request: web.Request) -> web.Response:

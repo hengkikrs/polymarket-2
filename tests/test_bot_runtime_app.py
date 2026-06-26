@@ -1749,12 +1749,13 @@ def test_daily_profit_halt_pauses_entries_until_next_day():
     async def run_check():
         bot = Bot.__new__(Bot)
         bot.state = SimpleNamespace(trading_enabled=True)
-        cfg = SimpleNamespace(daily_profit_stop_pct=40.0)
+        cfg = SimpleNamespace(daily_profit_stop_usd=80.0)
         daily = {"pnl": 82.0, "start_balance": 200.0, "halted": False, "halt_reason": ""}
 
         with (
             patch("bot_runtime.app.st.load_daily_pnl", return_value=daily),
             patch("bot_runtime.app.st.set_daily_halted") as set_halted,
+            patch("bot_runtime.app.st.set_trading_enabled") as set_trading,
             patch.object(bot, "_sync_stats") as sync_stats,
             patch.object(bot, "_save") as save_state,
             patch("bot_runtime.app.tg.send", AsyncMock()) as send_notification,
@@ -1763,9 +1764,10 @@ def test_daily_profit_halt_pauses_entries_until_next_day():
             await asyncio.sleep(0)
 
         assert halted is True
-        assert bot.state.trading_enabled is False
+        assert bot.state.trading_enabled is True
         assert bot.state.status == "daily_profit_stop"
         set_halted.assert_called_once()
+        set_trading.assert_not_called()
         assert "Daily profit target reached" in set_halted.call_args.args[1]
         sync_stats.assert_called_once()
         save_state.assert_called_once_with(force=True)
@@ -1777,7 +1779,7 @@ def test_daily_profit_halt_pauses_entries_until_next_day():
 def test_daily_profit_halt_ignores_below_threshold():
     bot = Bot.__new__(Bot)
     bot.state = SimpleNamespace(trading_enabled=True)
-    cfg = SimpleNamespace(daily_profit_stop_pct=40.0)
+    cfg = SimpleNamespace(daily_profit_stop_usd=80.0)
     daily = {"pnl": 79.99, "start_balance": 200.0, "halted": False, "halt_reason": ""}
 
     with (
@@ -1794,30 +1796,56 @@ def test_daily_profit_halt_ignores_below_threshold():
     save_state.assert_not_called()
 
 
-def test_profit_stop_usd_stops_on_cumulative_profit():
+def test_daily_profit_halt_clears_when_target_is_raised():
+    bot = Bot.__new__(Bot)
+    bot.state = SimpleNamespace(trading_enabled=False)
+    cfg = SimpleNamespace(daily_profit_stop_usd=250.0)
+    daily = {
+        "pnl": 110.39,
+        "start_balance": 200.0,
+        "halted": True,
+        "halt_reason": "Daily profit target reached",
+    }
+
+    with (
+        patch("bot_runtime.app.st.load_daily_pnl", return_value=daily),
+        patch("bot_runtime.app.st.set_daily_halted") as set_halted,
+        patch.object(bot, "_sync_stats") as sync_stats,
+        patch.object(bot, "_save") as save_state,
+    ):
+        stopped = bot._apply_daily_profit_halt(cfg)
+
+    assert stopped is False
+    set_halted.assert_called_once_with(False)
+    sync_stats.assert_not_called()
+    save_state.assert_not_called()
+
+
+def test_daily_profit_halt_ignores_cumulative_profit():
     bot = Bot.__new__(Bot)
     bot._session_pnl = 25.0
     bot.state = SimpleNamespace(
         trading_enabled=True,
         status="scanning",
         bot_status="scanning",
-        total_pnl=1000.01,
+        total_pnl=10000.0,
         session_pnl=25.0,
     )
+    daily = {"pnl": 499.99, "start_balance": 200.0, "halted": False, "halt_reason": ""}
 
     with (
-        patch("bot_runtime.app.st.set_trading_enabled") as set_trading,
-        patch.object(bot, "_sync_stats"),
+        patch("bot_runtime.app.st.load_daily_pnl", return_value=daily),
+        patch("bot_runtime.app.st.set_daily_halted") as set_halted,
+        patch.object(bot, "_sync_stats") as sync_stats,
         patch.object(bot, "_save") as save_state,
     ):
-        stopped = bot._enforce_profit_stop(SimpleNamespace(profit_stop_usd=1000.0), "test")
+        stopped = bot._apply_daily_profit_halt(SimpleNamespace(daily_profit_stop_usd=500.0))
 
-    assert stopped is True
-    assert bot.state.trading_enabled is False
-    assert bot.state.status == "profit_stop"
-    assert bot.state.bot_status == "profit_stop"
-    set_trading.assert_called_once_with(False)
-    save_state.assert_called_once_with(force=True)
+    assert stopped is False
+    assert bot.state.trading_enabled is True
+    set_halted.assert_not_called()
+    sync_stats.assert_not_called()
+    save_state.assert_not_called()
 
 
 def test_live_final_force_attempt_keeps_preflight_enabled():
@@ -2013,7 +2041,7 @@ def test_directional_resolver_prefers_gamma_metadata_resolution():
     assert "30m Saturation 0.94: 106.3s" in send_notification.await_args.args[0]
 
 
-def test_directional_resolver_stops_when_cumulative_profit_reaches_usd_limit():
+def test_directional_resolver_does_not_stop_on_window_or_cumulative_profit():
     bot = Bot.__new__(Bot)
     bot.state = SimpleNamespace(
         balance=0.0,
@@ -2053,12 +2081,11 @@ def test_directional_resolver_stops_when_cumulative_profit_reaches_usd_limit():
         patch("bot_runtime.app.st.add_balance"),
         patch("bot_runtime.app.st.update_daily_pnl"),
         patch("bot_runtime.app.st.load_settings", return_value=SimpleNamespace(
-            profit_stop_usd=1000.0,
+            daily_profit_stop_usd=0.0,
             trade_amount=100.0,
             max_trades_per_window=9,
-            profit_stop_pct=100.0,
         )),
-        patch("bot_runtime.app.st.set_trading_enabled") as set_trading,
+        patch.object(bot, "_apply_daily_profit_halt", return_value=False) as daily_halt,
         patch.object(bot, "_sync_stats"),
         patch.object(bot, "_save"),
         patch("bot_runtime.app.st.load_snapshots", return_value=[]),
@@ -2069,9 +2096,8 @@ def test_directional_resolver_stops_when_cumulative_profit_reaches_usd_limit():
 
     assert out == resolved
     assert bot.state.session_pnl == 1000.5
-    assert bot.state.trading_enabled is False
-    assert bot.state.status == "profit_stop"
-    set_trading.assert_called_once_with(False)
+    assert bot.state.trading_enabled is True
+    daily_halt.assert_called_once()
 
 
 def test_directional_resolver_defers_when_gamma_outcome_is_unavailable():

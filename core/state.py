@@ -8,8 +8,15 @@ state.py — Shared state + settings store (v2 hardened)
 """
 import json, time, logging, threading, os, tempfile
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except Exception:  # pragma: no cover - older Python or missing zoneinfo.
+    ZoneInfo = None
+    ZoneInfoNotFoundError = Exception
 
 log = logging.getLogger("state")
 
@@ -127,8 +134,7 @@ class BotSettings:
     max_trades_per_window: int   = 9
     trade_amount: float          = 100.0
     max_loss_per_trade: float    = 10.0
-    profit_stop_pct: float       = 100.0
-    profit_stop_usd: float       = 1000.0
+    daily_profit_stop_usd: float = 1000.0
     t1_enabled: bool             = True
     t2_enabled: bool             = True
     t3_enabled: bool             = True
@@ -227,7 +233,6 @@ class BotSettings:
     max_consecutive_losses: int  = 5
     # ── Daily circuit breakers (reset setiap UTC midnight) ────────────────
     max_daily_loss: float        = 20.0
-    daily_profit_stop_pct: float = 40.0
     # ── Recovery mode (informational only — tidak ada sizing scale-down):
     # entered setelah X consecutive losses, exited setelah Y wins.
     # Tetap di-track untuk dashboard awareness, tapi tidak ubah trade_amount.
@@ -343,11 +348,10 @@ def update_settings(data: dict) -> BotSettings:
         "trail_activate_usd":    (0.01, 100.0),
         "trail_drop_price":      (0.005, 0.50),
         "force_exit_secs":       (3.0, 120.0),
-        "profit_stop_usd":       (0.0, 1000000.0),
+        "daily_profit_stop_usd": (0.0, 1000000.0),
         "max_session_loss":      (5.0, 10000.0),
         "max_consecutive_losses":(2, 50),
         "max_daily_loss":        (1.0, 10000.0),
-        "daily_profit_stop_pct": (0.0, 10000.0),
         "recovery_after_losses": (2, 20),
         "recovery_size_pct":     (0.1, 1.0),
         "recovery_exit_wins":    (1, 10),
@@ -473,21 +477,35 @@ def deposit_balance(amount: float) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  DAILY PNL TRACKER (UTC-based, auto-reset at midnight)
+#  DAILY PNL TRACKER (local trading day, auto-reset at daily midnight)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DAILY_PNL_FILE = _DATA_DIR / "daily_pnl.json"
 
 
-def _today_utc() -> str:
-    """Return today's UTC date as YYYY-MM-DD string."""
-    return time.strftime("%Y-%m-%d", time.gmtime())
+def _daily_timezone():
+    tz_name = (os.getenv("POLY_DAILY_TIMEZONE") or "Asia/Bangkok").strip()
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(tz_name)
+        except ZoneInfoNotFoundError:
+            pass
+    if tz_name in {"Asia/Bangkok", "ICT", "+07", "+07:00", "UTC+7"}:
+        return timezone(timedelta(hours=7), name="Asia/Bangkok")
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def _daily_date(ts: Optional[float] = None) -> str:
+    tz = _daily_timezone()
+    if ts is None:
+        return datetime.now(tz).strftime("%Y-%m-%d")
+    return datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d")
 
 
 def load_daily_pnl() -> dict:
-    """Load today's PnL. Auto-reset jika date berubah (UTC midnight crossing)."""
+    """Load today's PnL. Auto-reset jika date berubah pada timezone trading."""
     data = _safe_read_json(DAILY_PNL_FILE)
-    today = _today_utc()
+    today = _daily_date()
     if not data or not isinstance(data, dict) or data.get("date") != today:
         start_balance = float(load_balance().get("balance", 0.0) or 0.0)
         data = {"date": today, "pnl": 0.0, "trades": 0,
@@ -713,12 +731,12 @@ class BotState:
     ledger_balance_drift: float = 0.0
     ledger_balance_ok: bool = True
     # ── Risk metrics (8/10 readiness) ───────────────────────────────────
-    daily_pnl: float = 0.0          # today's PnL (UTC-reset at midnight)
+    daily_pnl: float = 0.0          # today's PnL (trading-timezone reset)
     daily_trades: int = 0           # today's trade count
     daily_halted: bool = False      # True if daily loss/profit stop reached
     daily_halt_reason: str = ""
     daily_start_balance: float = 0.0
-    daily_profit_stop_pct: float = 0.0
+    daily_profit_stop_usd: float = 0.0
     daily_profit_stop_amount: float = 0.0
     in_recovery: bool = False       # post-loss-streak (informational)
     recovery_streak_wins: int = 0   # consecutive wins towards exit recovery
@@ -846,7 +864,7 @@ def rebuild_cum_stats(trades: list[dict] | None = None) -> dict:
 def rebuild_daily_pnl(trades: list[dict] | None = None) -> dict:
     """Rebuild today's daily PnL from resolved trades after corrections."""
     trades = trades if trades is not None else load_trades()
-    today = _today_utc()
+    today = _daily_date()
     old = _safe_read_json(DAILY_PNL_FILE)
     start_balance = float(load_balance().get("balance", 0.0) or 0.0)
     if isinstance(old, dict) and old.get("date") == today:
@@ -861,7 +879,7 @@ def rebuild_daily_pnl(trades: list[dict] | None = None) -> dict:
         if not t.get("resolved"):
             continue
         ts = float(t.get("timestamp") or 0.0)
-        if ts <= 0 or time.strftime("%Y-%m-%d", time.gmtime(ts)) != today:
+        if ts <= 0 or _daily_date(ts) != today:
             continue
         won = t.get("won")
         data["pnl"] = round(data["pnl"] + float(t.get("pnl") or 0.0), 4)

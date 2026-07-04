@@ -49,6 +49,21 @@ class LatencyConfigTests(unittest.TestCase):
 
         self.assertEqual(sample, (62_300.0, 1_800_000_000.0, 0.0))
 
+    def test_source_btc_at_time_can_prefer_open_sample_not_future_tick(self):
+        cache = ws_feed.PriceCache()
+        cache.set_source_btc(62_300.0, "chainlink", timestamp=1_800_000_000.0)
+        cache.set_source_btc(62_350.0, "chainlink", timestamp=1_800_000_000.2)
+
+        sample = cache.source_btc_at_time(
+            "chainlink",
+            1_800_000_000.1,
+            max_drift=0.5,
+            prefer_at_or_before=True,
+        )
+
+        self.assertEqual(sample[:2], (62_300.0, 1_800_000_000.0))
+        self.assertAlmostEqual(sample[2], 0.1, places=6)
+
     def test_coinbase_price_extracts_btc_usd_ticker(self):
         price = ws_feed._coinbase_price({
             "channel": "ticker",

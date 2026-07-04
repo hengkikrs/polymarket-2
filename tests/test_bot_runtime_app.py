@@ -1734,7 +1734,7 @@ def test_btc_open_uses_chainlink_window_open_when_gamma_target_is_missing():
     market = _market()
     market.target_price = 0.0
     cache = SimpleNamespace(
-        source_btc_at_time=lambda source, timestamp, max_drift: (64_123.45, timestamp + 0.2, 0.2)
+        source_btc_at_time=lambda source, timestamp, max_drift, **_kwargs: (64_123.45, timestamp + 0.2, 0.2)
     )
 
     with patch("bot_runtime.app.get_cache", return_value=cache):
@@ -1749,7 +1749,7 @@ def test_btc_open_uses_mock_chainlink_open_fallback_after_restart():
     market = _market()
     market.target_price = 0.0
     cache = SimpleNamespace(
-        source_btc_at_time=lambda source, timestamp, max_drift: (
+        source_btc_at_time=lambda source, timestamp, max_drift, **_kwargs: (
             (64_123.45, timestamp + 25.0, 25.0) if max_drift >= 25.0 else None
         )
     )

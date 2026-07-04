@@ -181,7 +181,14 @@ class PriceCache:
             return None
         return best
 
-    def source_btc_at_time(self, source: str, target_ts: float, max_drift: float = 2.0):
+    def source_btc_at_time(
+        self,
+        source: str,
+        target_ts: float,
+        max_drift: float = 2.0,
+        *,
+        prefer_at_or_before: bool = False,
+    ):
         prefix = str(source or "").strip().lower()
         history = [
             sample
@@ -191,7 +198,12 @@ class PriceCache:
         ]
         if not history:
             return None
-        price_ts = min(history, key=lambda sample: abs(sample[0] - target_ts))
+        candidates = history
+        if prefer_at_or_before:
+            before = [sample for sample in history if sample[0] <= target_ts]
+            if before:
+                candidates = before
+        price_ts = min(candidates, key=lambda sample: abs(sample[0] - target_ts))
         drift = abs(price_ts[0] - target_ts)
         if drift > max_drift:
             return None

@@ -571,13 +571,27 @@ class Bot:
         if market.target_price > 0:
             return float(market.target_price), "Polymarket priceToBeat"
         source_at_time = getattr(get_cache(), "source_btc_at_time", None)
-        snap = source_at_time("chainlink", float(window_ts), max_drift=2.0) if source_at_time else None
+        snap = (
+            source_at_time(
+                "chainlink",
+                float(window_ts),
+                max_drift=2.0,
+                prefer_at_or_before=True,
+            )
+            if source_at_time
+            else None
+        )
         if snap:
             price, _ts, drift = snap
             return float(price), f"Polymarket Chainlink open drift={float(drift):.2f}s"
         if config.MOCK_MODE and source_at_time:
             max_drift = min(60.0, max(2.0, time.time() - float(window_ts or 0)))
-            snap = source_at_time("chainlink", float(window_ts), max_drift=max_drift)
+            snap = source_at_time(
+                "chainlink",
+                float(window_ts),
+                max_drift=max_drift,
+                prefer_at_or_before=True,
+            )
             if snap:
                 price, _ts, drift = snap
                 return float(price), f"MOCK Chainlink open fallback drift={float(drift):.2f}s"

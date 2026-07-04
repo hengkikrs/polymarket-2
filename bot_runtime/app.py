@@ -28,19 +28,27 @@ from strategies import end_window as end_window_strategy
 TICK_INTERVAL: float = float(os.getenv("TICK_INTERVAL", "0.01"))
 SAVE_STATE_INTERVAL: float = float(os.getenv("SAVE_STATE_INTERVAL", "0.5"))
 SNAPSHOT_INTERVAL: float = float(os.getenv("SNAPSHOT_INTERVAL", "1.0"))
+LIVE_ACCOUNT_REFRESH_INTERVAL: float = float(os.getenv("LIVE_ACCOUNT_REFRESH_INTERVAL", "10.0"))
 FAST_REFRESH_SECS_LEFT: float = float(os.getenv("FAST_REFRESH_SECS_LEFT", "8.0"))
 FAST_REFRESH_TIMEOUT_SECS: float = float(os.getenv("FAST_REFRESH_TIMEOUT_SECS", "0.08"))
 MARKET_REFRESH_TIMEOUT_SECS: float = float(os.getenv("MARKET_REFRESH_TIMEOUT_SECS", "0.06"))
+MARKET_DISCOVERY_ATTEMPT_TIMEOUT_SECS: float = float(os.getenv("MARKET_DISCOVERY_ATTEMPT_TIMEOUT_SECS", "1.5"))
+MARKET_DISCOVERY_RETRY_INTERVAL_SECS: float = float(os.getenv("MARKET_DISCOVERY_RETRY_INTERVAL_SECS", "1.0"))
+MISSING_TARGET_REFETCH_SECS: float = float(os.getenv("END_WINDOW_MISSING_TARGET_REFETCH_SECS", "2.0"))
+MISSING_TARGET_FETCH_TIMEOUT_SECS: float = float(os.getenv("END_WINDOW_MISSING_TARGET_FETCH_TIMEOUT_SECS", "1.5"))
 BTC_REST_INTERVAL: float = float(os.getenv("BTC_REST_INTERVAL", "0.5"))
 BTC_HOT_CACHE_MAX_AGE_SECS: float = float(os.getenv("BTC_HOT_CACHE_MAX_AGE_SECS", "0.35"))
 PRICE_SOURCE_TIMEOUT_SECS: float = float(os.getenv("PRICE_SOURCE_TIMEOUT_SECS", "0.5"))
 OFFICIAL_RESOLVE_RETRIES: int = int(float(os.getenv("END_WINDOW_OFFICIAL_RESOLVE_RETRIES", "8")))
 OFFICIAL_RESOLVE_DELAY_SECS: float = float(os.getenv("END_WINDOW_OFFICIAL_RESOLVE_DELAY_SECS", "0.5"))
 OFFICIAL_RETRY_INTERVAL_SECS: float = float(os.getenv("END_WINDOW_OFFICIAL_RETRY_INTERVAL_SECS", "2.0"))
+CHAINLINK_RESOLVE_GRACE_SECS: float = float(os.getenv("END_WINDOW_CHAINLINK_RESOLVE_GRACE_SECS", "65.0"))
+CHAINLINK_RESOLVE_MAX_DRIFT_SECS: float = float(os.getenv("END_WINDOW_CHAINLINK_RESOLVE_MAX_DRIFT_SECS", "2.0"))
 EXCHANGE_PRICE_MAX_AGE_SECS: float = float(os.getenv("EXCHANGE_PRICE_MAX_AGE_SECS", "3.0"))
 CHAINLINK_PRICE_MAX_AGE_SECS: float = float(os.getenv("CHAINLINK_PRICE_MAX_AGE_SECS", "10.0"))
 # FIX #2: re-sync target resmi (priceToBeat) Polymarket selama window.
 TARGET_RESYNC_SECS: float = float(os.getenv("END_WINDOW_TARGET_RESYNC_SECS", "3.0"))
+TARGET_RESYNC_TIMEOUT_SECS: float = float(os.getenv("END_WINDOW_TARGET_RESYNC_TIMEOUT_SECS", "0.05"))
 # Saat target resmi belum terkonfirmasi DAN |btc_now-btc_open| <= ambang ini
 # (near-the-money), bot menahan trade agar tidak salah arah. 0 = nonaktif.
 TARGET_NEAR_STRIKE_USD: float = float(os.getenv("END_WINDOW_TARGET_NEAR_STRIKE_USD", "5.0"))
@@ -53,7 +61,10 @@ class Bot:
         self._ws_feed = WsFeed()
         self._last_save_state = 0.0
         self._last_snapshot = 0.0
+        self._last_live_account_refresh = 0.0
         self._last_directional_orphan_resolve_check = 0.0
+        self._live_account_refresh_inflight = False
+        self._directional_orphan_resolve_inflight = False
         self._session_pnl = 0.0
         self._close_btc: dict[int, float] = {}
         self._last_btc_rest_ts = 0.0
@@ -64,6 +75,9 @@ class Bot:
         self._context_inflight = False  # FIX #1: regime analysis off hot path
         self._target_locked_official = False  # FIX #2: priceToBeat re-sync state
         self._last_target_resync = 0.0
+        self._target_resync_task: asyncio.Task | None = None
+        self._pending_official_target: tuple[int, float, mkt.BTCMarket] | None = None
+        self._last_target_unconfirmed_log = 0.0
         self._window_settings: st.BotSettings | None = None
         self._telegram_task: asyncio.Task | None = None
 
@@ -74,6 +88,7 @@ class Bot:
             st.set_trading_enabled(False)
         bal = st.load_balance()
         cfg = st.load_settings()
+        prev_state = st.load_state()
         _restored_trading = st.get_trading_enabled() if config.MOCK_MODE else False
         self.state = st.BotState(
             started_at=time.time(),
@@ -85,6 +100,15 @@ class Bot:
             bot_status="scanning" if _restored_trading else "waiting",
             status="scanning" if _restored_trading else "waiting",
             active_settings=st.asdict(cfg),
+            live_cash=float(prev_state.get("live_cash", 0.0) or 0.0),
+            live_portfolio=float(prev_state.get("live_portfolio", 0.0) or 0.0),
+            live_total=float(prev_state.get("live_total", 0.0) or 0.0),
+            live_balance_ok=bool(prev_state.get("live_balance_ok", False)),
+            live_balance_error=str(prev_state.get("live_balance_error", "") or ""),
+            live_balance_last_ok_ts=float(prev_state.get("live_balance_last_ok_ts", 0.0) or 0.0),
+            live_portfolio_ok=bool(prev_state.get("live_portfolio_ok", False)),
+            live_portfolio_error=str(prev_state.get("live_portfolio_error", "") or ""),
+            live_portfolio_source=str(prev_state.get("live_portfolio_source", "") or ""),
         )
         self._sync_stats()
         self._save(force=True)
@@ -134,7 +158,7 @@ class Bot:
         self.state.win_rate = float(stats.get("win_rate", 0.0) or 0.0)
         self.state.total_wagered = float(stats.get("total_wagered", 0.0) or 0.0)
         self.state.recent_win_rate = float(stats.get("recent_win_rate", 0.0) or 0.0)
-        daily = st.load_daily_pnl()
+        daily = self._daily_pnl_for_mode(trades)
         self.state.daily_pnl = float(daily.get("pnl", 0.0) or 0.0)
         self.state.daily_trades = int(daily.get("trades", 0) or 0)
         self.state.daily_halted = bool(daily.get("halted", False))
@@ -149,6 +173,53 @@ class Bot:
             self.state.ledger_balance_ok = ledger["ledger_balance_ok"]
         self._update_open_legs(trades)
 
+    async def _refresh_live_account(self, session: aiohttp.ClientSession, *, force: bool = False) -> None:
+        if config.MOCK_MODE:
+            return
+        now = time.time()
+        if not force and now - self._last_live_account_refresh < LIVE_ACCOUNT_REFRESH_INTERVAL:
+            return
+        self._last_live_account_refresh = now
+        cash = await trader.fetch_live_balance(session)
+        portfolio = await trader.fetch_live_portfolio(session)
+        cash_ok = bool(cash.get("ok", False))
+        portfolio_ok = bool(portfolio.get("ok", False))
+        if cash_ok:
+            self.state.live_cash = float(cash.get("cash", 0.0) or 0.0)
+            self.state.live_balance_error = ""
+            self.state.live_balance_last_ok_ts = float(cash.get("ts", time.time()) or time.time())
+        else:
+            self.state.live_balance_error = str(cash.get("error", "") or "balance fetch failed")
+        if portfolio_ok:
+            self.state.live_portfolio = float(portfolio.get("portfolio", 0.0) or 0.0)
+            self.state.live_portfolio_error = ""
+        else:
+            self.state.live_portfolio_error = str(portfolio.get("error", "") or "portfolio fetch failed")
+        self.state.live_total = round(self.state.live_cash + self.state.live_portfolio, 4)
+        self.state.live_balance_ok = cash_ok
+        self.state.live_portfolio_ok = portfolio_ok
+        self.state.live_portfolio_source = "polymarket"
+
+    async def _refresh_live_account_bg(self, session: aiohttp.ClientSession, *, force: bool = False) -> None:
+        try:
+            await self._refresh_live_account(session, force=force)
+        finally:
+            self._live_account_refresh_inflight = False
+
+    def _schedule_live_account_refresh(self, session: aiohttp.ClientSession, *, force: bool = False) -> None:
+        if config.MOCK_MODE or bool(getattr(self, "_live_account_refresh_inflight", False)):
+            return
+        now = time.time()
+        last_refresh = float(getattr(self, "_last_live_account_refresh", 0.0) or 0.0)
+        if not force and now - last_refresh < LIVE_ACCOUNT_REFRESH_INTERVAL:
+            return
+        self._live_account_refresh_inflight = True
+        task = asyncio.create_task(
+            self._refresh_live_account_bg(session, force=force),
+            name="live_account_refresh",
+        )
+        task.add_done_callback(self._on_bg_task_done)
+
     @staticmethod
     def _daily_profit_stop_amount(cfg: st.BotSettings, daily: dict) -> float:
         del daily
@@ -157,26 +228,110 @@ class Bot:
             return 0.0
         return round(amount, 4)
 
+    @staticmethod
+    def _trade_daily_ts(trade: dict) -> float:
+        for key in ("resolved_ts", "exit_ts", "timestamp"):
+            try:
+                ts = float(trade.get(key) or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            if ts > 0:
+                return ts
+        return 0.0
+
+    def _daily_pnl_for_mode(self, trades: list[dict] | None = None) -> dict:
+        daily = st.load_daily_pnl()
+        if config.MOCK_MODE:
+            return daily
+
+        trades = trades if trades is not None else st.load_trades()
+        today = st._daily_date(time.time())
+        out = {
+            **daily,
+            "pnl": 0.0,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "halted": False,
+            "halt_reason": "",
+        }
+        for trade in trades:
+            if not trade.get("resolved") or bool(trade.get("mock", True)):
+                continue
+            ts = self._trade_daily_ts(trade)
+            if ts <= 0 or st._daily_date(ts) != today:
+                continue
+            out["pnl"] = round(float(out["pnl"]) + float(trade.get("pnl") or 0.0), 4)
+            out["trades"] = int(out["trades"]) + 1
+            if trade.get("won") is True:
+                out["wins"] = int(out["wins"]) + 1
+            elif trade.get("won") is False:
+                out["losses"] = int(out["losses"]) + 1
+        return out
+
     def _apply_daily_profit_halt(self, cfg: st.BotSettings | None = None) -> bool:
         cfg = cfg or self._load_cfg()
-        daily = st.load_daily_pnl()
+        daily = self._daily_pnl_for_mode()
         stop_amount = self._daily_profit_stop_amount(cfg, daily)
         daily_pnl = float(daily.get("pnl", 0.0) or 0.0)
         if stop_amount <= 0 or daily_pnl < stop_amount:
-            if bool(daily.get("halted", False)):
+            if config.MOCK_MODE and bool(daily.get("halted", False)):
                 st.set_daily_halted(False)
+            self.state.daily_pnl = daily_pnl
+            self.state.daily_halted = False
+            self.state.daily_halt_reason = ""
             return False
 
         reason = (
             f"Daily profit target reached: ${daily_pnl:.2f} "
             f">= ${stop_amount:.2f}"
         )
-        if not bool(daily.get("halted", False)) or daily.get("halt_reason") != reason:
+        already_halted = bool(daily.get("halted", False)) if config.MOCK_MODE else bool(getattr(self.state, "daily_halted", False))
+        current_reason = str(daily.get("halt_reason", "") or "") if config.MOCK_MODE else str(getattr(self.state, "daily_halt_reason", "") or "")
+        if not already_halted or current_reason != reason:
             log.info("%s. Pausing entries until next trading day.", reason)
-            st.set_daily_halted(True, reason)
+            if config.MOCK_MODE:
+                st.set_daily_halted(True, reason)
             asyncio.create_task(tg.send(f"⚠️ **DAILY PROFIT STOP**\n{reason}\nBot will resume on the next trading day."))
-        self.state.status = self.state.bot_status = "daily_profit_stop"
         self._sync_stats()
+        self.state.daily_pnl = daily_pnl
+        self.state.daily_halted = True
+        self.state.daily_halt_reason = reason
+        self.state.status = self.state.bot_status = "daily_profit_stop"
+        self._save(force=True)
+        return True
+
+    async def _apply_live_balance_gate(self, session: aiohttp.ClientSession, cfg: st.BotSettings) -> bool:
+        if config.MOCK_MODE:
+            return False
+        self._schedule_live_account_refresh(session)
+        strategy_cfg = end_window_strategy.EndWindowConfig.from_settings(cfg)
+        min_required = max(0.0, float(strategy_cfg.live_trade_usd or 0.0))
+        if min_required <= 0:
+            return False
+        if not bool(getattr(self.state, "live_balance_ok", False)):
+            current_reason = str(getattr(self.state, "circuit_breaker_reason", "") or "")
+            if current_reason.startswith("live balance unavailable:"):
+                self.state.circuit_breaker_reason = ""
+            return False
+        live_cash = float(self.state.live_cash or 0.0)
+        if live_cash + 1e-9 >= min_required:
+            current_reason = str(getattr(self.state, "circuit_breaker_reason", "") or "")
+            if (
+                current_reason.startswith("live balance unavailable:")
+                or current_reason.startswith("insufficient live balance:")
+            ):
+                self.state.circuit_breaker_reason = ""
+            return False
+        reason = f"insufficient live balance: cash ${live_cash:.2f} < min order ${min_required:.2f}"
+        if self.state.status != "insufficient_balance" or self.state.bot_status != "insufficient_balance":
+            log.warning("[LIVE] %s", reason)
+        self.state.trading_enabled = bool(st.get_trading_enabled())
+        self.state.status = self.state.bot_status = "insufficient_balance"
+        self.state.circuit_breaker_reason = reason
+        self._sync_stats()
+        self.state.status = self.state.bot_status = "insufficient_balance"
+        self.state.circuit_breaker_reason = reason
         self._save(force=True)
         return True
 
@@ -220,6 +375,26 @@ class Bot:
             self.state.open_trigger = ""
             self.state.open_amount_usd = 0.0
             self.state.open_unrealized_pnl = 0.0
+
+    @staticmethod
+    def _entry_scan_due(cfg: st.BotSettings, strategy_cfg: end_window_strategy.EndWindowConfig, secs_left: float) -> bool:
+        secs = float(secs_left or 0.0)
+        if bool(getattr(cfg, "buy1_enabled", False)):
+            min_secs = float(getattr(cfg, "buy1_min_secs_left", 20.0) or 0.0)
+            max_secs = float(getattr(cfg, "buy1_max_secs_left", 260.0) or 0.0)
+            if min_secs < secs <= max_secs:
+                return True
+        for index in range(1, 7):
+            if bool(getattr(cfg, f"time{index}_enabled", False)):
+                min_secs = float(getattr(cfg, f"time{index}_min_secs_left", 3.0) or 0.0)
+                max_secs = float(getattr(cfg, f"time{index}_max_secs_left", 299.0) or 0.0)
+                if min_secs < secs <= max_secs:
+                    return True
+        for index, layer in enumerate(strategy_cfg.layers, start=1):
+            if bool(getattr(cfg, f"t{index}_enabled", False)):
+                if float(layer.seconds_left_min) <= secs <= float(layer.seconds_left_max) + 1.0:
+                    return True
+        return bool(getattr(strategy_cfg, "fast_open_enabled", False))
 
     def _save(self, *, force: bool = False) -> None:
         now = time.time()
@@ -276,6 +451,24 @@ class Bot:
         finally:
             self._context_inflight = False
 
+    async def _target_resync_bg(
+        self,
+        session: aiohttp.ClientSession,
+        window_ts: int,
+        market_interval: int,
+    ) -> None:
+        try:
+            fresh = await mkt.fetch_market(session, "BTC", interval_secs=market_interval)
+            if not fresh or int(getattr(fresh, "window_ts", 0) or 0) != int(window_ts):
+                return
+            official = float(getattr(fresh, "target_price", 0.0) or 0.0)
+            if official > 0:
+                self._pending_official_target = (int(window_ts), official, fresh)
+        except Exception as exc:
+            log.debug("[FIX#2] target re-fetch failed: %s", exc)
+        finally:
+            self._target_resync_task = None
+
     async def _resync_official_target(
         self,
         session: aiohttp.ClientSession,
@@ -298,29 +491,27 @@ class Bot:
         if market.target_price > 0 and abs(float(market.target_price) - float(btc_open)) <= 1e-6:
             self._target_locked_official = True
             return btc_open, market
-        if now - self._last_target_resync < TARGET_RESYNC_SECS:
-            return btc_open, market
-        self._last_target_resync = now
-        try:
-            fresh = await asyncio.wait_for(
-                mkt.fetch_market(session, "BTC", interval_secs=market_interval),
-                timeout=PRICE_SOURCE_TIMEOUT_SECS,
-            )
-        except Exception as exc:
-            log.debug("[FIX#2] target re-fetch failed: %s", exc)
-            return btc_open, market
-        if not fresh or int(getattr(fresh, "window_ts", 0) or 0) != int(window_ts):
-            return btc_open, market
-        official = float(getattr(fresh, "target_price", 0.0) or 0.0)
-        if official > 0:
+        pending = self._pending_official_target
+        if pending and pending[0] == int(window_ts):
+            _pending_window, official, fresh_market = pending
+            self._pending_official_target = None
             if abs(official - float(btc_open)) > 1e-6:
                 log.warning(
                     "[FIX#2] btc_open re-synced ke priceToBeat resmi: %.2f -> %.2f (drift %.2f)",
                     float(btc_open), official, official - float(btc_open),
                 )
-            market.target_price = official
+            fresh_market.target_price = official
             self._target_locked_official = True
-            return official, market
+            return official, fresh_market
+        if now - self._last_target_resync < TARGET_RESYNC_SECS:
+            return btc_open, market
+        self._last_target_resync = now
+        if self._target_resync_task is None or self._target_resync_task.done():
+            self._target_resync_task = asyncio.create_task(
+                self._target_resync_bg(session, window_ts, market_interval),
+                name="target_resync",
+            )
+            self._target_resync_task.add_done_callback(self._on_bg_task_done)
         return btc_open, market
 
     async def _btc_now(self, session: aiohttp.ClientSession) -> float:
@@ -328,9 +519,11 @@ class Bot:
         now = time.time()
         source_price = getattr(cache, "source_btc", None)
         source_age = getattr(cache, "source_btc_age", None)
+        coinbase_enabled = os.getenv("COINBASE_WS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+        gateio_enabled = os.getenv("GATEIO_WS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
         chainlink = source_price("chainlink", CHAINLINK_PRICE_MAX_AGE_SECS) if source_price else None
-        coinbase = source_price("coinbase", EXCHANGE_PRICE_MAX_AGE_SECS) if source_price else None
-        gateio = source_price("gateio", EXCHANGE_PRICE_MAX_AGE_SECS) if source_price else None
+        coinbase = source_price("coinbase", EXCHANGE_PRICE_MAX_AGE_SECS) if source_price and coinbase_enabled else None
+        gateio = source_price("gateio", EXCHANGE_PRICE_MAX_AGE_SECS) if source_price and gateio_enabled else None
         if chainlink and float(chainlink) > 0:
             self._last_btc_source = "chainlink"
             self._last_chainlink_age = float(source_age("chainlink")) if source_age else 0.0
@@ -344,7 +537,7 @@ class Bot:
             
         if coinbase and float(coinbase) > 0:
             self._last_btc_source = "coinbase (fallback)"
-            self._last_chainlink_age = float(source_age("coinbase")) if source_age else 0.0
+            self._last_chainlink_age = float(source_age("chainlink")) if source_age else 999.0
             exchange_ages = [
                 float(source_age(name))
                 for name, price in (("coinbase", coinbase), ("gateio", gateio))
@@ -355,7 +548,7 @@ class Bot:
             
         if gateio and float(gateio) > 0:
             self._last_btc_source = "gateio (fallback)"
-            self._last_chainlink_age = float(source_age("gateio")) if source_age else 0.0
+            self._last_chainlink_age = float(source_age("chainlink")) if source_age else 999.0
             exchange_ages = [
                 float(source_age(name))
                 for name, price in (("coinbase", coinbase), ("gateio", gateio))
@@ -371,7 +564,7 @@ class Bot:
             for name, price in (("coinbase", coinbase), ("gateio", gateio))
             if price and source_age
         ]
-        self._last_exchange_age = min(exchange_ages, default=float(cache.btc_age))
+        self._last_exchange_age = min(exchange_ages, default=999.0)
         return 0.0
 
     async def _btc_open(self, session: aiohttp.ClientSession, market: mkt.BTCMarket, window_ts: int) -> tuple[float, str]:
@@ -395,7 +588,14 @@ class Bot:
                 return float(chainlink), "MOCK Chainlink current fallback"
         return 0.0, "missing Polymarket priceToBeat"
 
-    async def _refresh_market(self, session: aiohttp.ClientSession, market: mkt.BTCMarket, secs_left: float) -> mkt.BTCMarket:
+    async def _refresh_market(
+        self,
+        session: aiohttp.ClientSession,
+        market: mkt.BTCMarket,
+        secs_left: float,
+        *,
+        allow_network: bool = True,
+    ) -> mkt.BTCMarket:
         cache = get_cache()
         refreshed_any = False
         for label, token_id in (("up", market.up_token), ("down", market.down_token)):
@@ -424,16 +624,98 @@ class Bot:
             market.book_ts = time.time()
         if market.up_ask > 0 and market.down_ask > 0:
             return market
+        if not allow_network:
+            return market
         try:
             coro = mkt.refresh_prices(session, market)
-            timeout = min(
-                FAST_REFRESH_TIMEOUT_SECS if secs_left <= FAST_REFRESH_SECS_LEFT else MARKET_REFRESH_TIMEOUT_SECS,
-                0.01,
-            )
+            timeout = FAST_REFRESH_TIMEOUT_SECS if secs_left <= FAST_REFRESH_SECS_LEFT else MARKET_REFRESH_TIMEOUT_SECS
             return await asyncio.wait_for(coro, timeout=max(0.01, timeout))
         except Exception as exc:
             log.debug("refresh_prices failed: %s", exc)
             return market
+
+    async def _fetch_current_market_once(
+        self,
+        session: aiohttp.ClientSession,
+        market_interval: int,
+        *,
+        timeout: float,
+    ) -> mkt.BTCMarket | None:
+        try:
+            return await asyncio.wait_for(
+                mkt.fetch_market(session, "BTC", interval_secs=market_interval),
+                timeout=max(0.1, float(timeout or 0.0)),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("market fetch attempt failed: %s", exc)
+            return None
+
+    async def _watch_window_without_market(
+        self,
+        session: aiohttp.ClientSession,
+        window_ts: int,
+        close_ts: int,
+        market_interval: int,
+    ) -> mkt.BTCMarket | None:
+        """Keep runtime state fresh while Gamma market discovery is delayed."""
+        log.warning("Market not found for window %d, retrying without freezing state.", window_ts)
+        last_attempt = 0.0
+        while self.running:
+            tick_started = time.perf_counter()
+            now = time.time()
+            secs_left = close_ts - now
+            secs_elapsed = now - window_ts
+            if secs_left <= 0:
+                break
+
+            btc_now = await self._btc_now(session)
+            if (
+                secs_left > 4.0
+                and now - last_attempt >= max(0.25, MARKET_DISCOVERY_RETRY_INTERVAL_SECS)
+            ):
+                last_attempt = now
+                market = await self._fetch_current_market_once(
+                    session,
+                    market_interval,
+                    timeout=MARKET_DISCOVERY_ATTEMPT_TIMEOUT_SECS,
+                )
+                if market is not None and int(getattr(market, "window_ts", 0) or 0) == int(window_ts):
+                    log.info("[END_WINDOW] recovered market for %s with %.1fs left", market.slug, secs_left)
+                    return market
+
+            cache = get_cache()
+            self.state.current_window = window_ts
+            self.state.market_interval_secs = market_interval
+            self.state.market_interval_label = mkt.market_interval_label(market_interval)
+            self.state.seconds_left = secs_left
+            self.state.secs_elapsed = secs_elapsed
+            self.state.btc_price = btc_now
+            self.state.btc_open = 0.0
+            self.state.btc_distance = 0.0
+            self.state.up_price = 0.0
+            self.state.down_price = 0.0
+            self.state.up_ask = 0.0
+            self.state.down_ask = 0.0
+            self.state.up_spread = 0.0
+            self.state.down_spread = 0.0
+            self.state.up_ask_depth = []
+            self.state.down_ask_depth = []
+            self.state.chainlink_age_secs = float(self._last_chainlink_age)
+            self.state.exchange_age_secs = float(self._last_exchange_age)
+            self.state.clob_age_secs = 999.0
+            self.state.price_feed_source = str(self._last_btc_source or cache.btc_source or "unknown")
+            self.state.leading = ""
+            self.state.market_question = f"BTC market pending {mkt.market_interval_label(market_interval)} {window_ts}"
+            self.state.status = self.state.bot_status = "market_pending"
+            self.state.balance = st.get_balance()
+            self.state.trading_enabled = st.get_trading_enabled()
+            self._update_open_legs()
+            self._save()
+            elapsed = time.perf_counter() - tick_started
+            await asyncio.sleep(max(TICK_INTERVAL, 0.5 - elapsed))
+        return None
 
     async def _fetch_window_close_btc(self, session: aiohttp.ClientSession, window_ts: int) -> float | None:
         cached = self._close_btc.pop(window_ts, None)
@@ -466,6 +748,69 @@ class Bot:
                 await asyncio.sleep(max(0.1, OFFICIAL_RESOLVE_DELAY_SECS))
         return await mkt.fetch_resolution(session, slug, allow_implied=True)
 
+    def _chainlink_close_snapshot(self, window_ts: int) -> tuple[float, float] | None:
+        close_ts = int(window_ts) + mkt.INTERVAL
+        source_at_time = getattr(get_cache(), "source_btc_at_time", None)
+        snap = (
+            source_at_time("chainlink", float(close_ts), max_drift=CHAINLINK_RESOLVE_MAX_DRIFT_SECS)
+            if source_at_time else None
+        )
+        if snap:
+            price, _ts, drift = snap
+            if price and float(price) > 0:
+                return float(price), float(drift)
+        cached = self._close_btc.get(int(window_ts))
+        if cached and float(cached) > 0:
+            return float(cached), 0.0
+        return None
+
+    @staticmethod
+    def _trade_price_to_beat(open_trades: list[dict]) -> float:
+        values = [
+            float(t.get("resolution_price_to_beat") or t.get("btc_open") or 0.0)
+            for t in open_trades
+        ]
+        values = [v for v in values if v > 0]
+        if not values:
+            return 0.0
+        first = values[0]
+        if any(abs(v - first) > 0.01 for v in values[1:]):
+            log.warning("[END_WINDOW] chainlink fallback skipped: mixed btc_open values %s", values)
+            return 0.0
+        return first
+
+    def _chainlink_fallback_resolution(
+        self,
+        open_trades: list[dict],
+        window_ts: int,
+        now: float,
+    ) -> dict | None:
+        close_ts = int(window_ts) + mkt.INTERVAL
+        if now < close_ts + CHAINLINK_RESOLVE_GRACE_SECS:
+            return None
+        price_to_beat = self._trade_price_to_beat(open_trades)
+        if price_to_beat <= 0:
+            return None
+        close_snapshot = self._chainlink_close_snapshot(window_ts)
+        if not close_snapshot:
+            return None
+        close_px, drift = close_snapshot
+        actual = "UP" if close_px >= price_to_beat else "DOWN"
+        log.info(
+            "[END_WINDOW] chainlink fallback resolution window=%d actual=%s close=%.2f target=%.2f drift=%.2fs",
+            window_ts,
+            actual,
+            close_px,
+            price_to_beat,
+            drift,
+        )
+        return {
+            "actual": actual,
+            "final_price": close_px,
+            "price_to_beat": price_to_beat,
+            "source": "chainlink_close_fallback",
+        }
+
     async def _watch_window_without_target(
         self,
         session: aiohttp.ClientSession,
@@ -480,6 +825,8 @@ class Bot:
         self.state.btc_distance = 0.0
         self.state.status = self.state.bot_status = "missing_target"
         log.warning("%s for %s, watching without trading until target is available.", source, market.slug)
+        last_refetch = 0.0
+        market_interval = max(1, int(close_ts - window_ts))
         while self.running:
             tick_started = time.perf_counter()
             now = time.time()
@@ -489,6 +836,16 @@ class Bot:
                 break
             btc_now = await self._btc_now(session)
             market = await self._refresh_market(session, market, secs_left)
+            if now - last_refetch >= max(0.5, MISSING_TARGET_REFETCH_SECS):
+                last_refetch = now
+                fresh = await self._fetch_current_market_once(
+                    session,
+                    market_interval,
+                    timeout=MISSING_TARGET_FETCH_TIMEOUT_SECS,
+                )
+                if fresh is not None and int(getattr(fresh, "window_ts", 0) or 0) == int(window_ts):
+                    market = fresh
+                    set_clob_tokens(market.up_token, market.down_token)
             recovered_open, recovered_source = await self._btc_open(session, market, window_ts)
             if recovered_open > 0:
                 log.info(
@@ -551,9 +908,13 @@ class Bot:
             groups.setdefault(str(trade.get("market_slug") or ""), []).append(trade)
 
         resolved: list[dict] = []
+        now = time.time()
         for slug in groups:
             resolution = await self._fetch_gamma_resolution(session, slug, source)
             actual = str((resolution or {}).get("actual") or "").upper()
+            if actual not in ("UP", "DOWN"):
+                resolution = self._chainlink_fallback_resolution(groups[slug], window_ts, now)
+                actual = str((resolution or {}).get("actual") or "").upper()
             if actual not in ("UP", "DOWN"):
                 log.warning(
                     "[END_WINDOW] resolve deferred: official Gamma outcome unavailable for %s source=%s",
@@ -630,6 +991,33 @@ class Bot:
         })
         for old_window in windows:
             await self._resolve_directional_window(session, old_window, source="retry-official")
+
+    async def _resolve_closed_directional_orphans_bg(
+        self,
+        session: aiohttp.ClientSession,
+        current_window_ts: int,
+    ) -> None:
+        try:
+            await self._resolve_closed_directional_orphans(session, current_window_ts)
+        finally:
+            self._directional_orphan_resolve_inflight = False
+
+    def _schedule_closed_directional_orphans(
+        self,
+        session: aiohttp.ClientSession,
+        current_window_ts: int,
+    ) -> None:
+        if self._directional_orphan_resolve_inflight:
+            return
+        now = time.time()
+        if now - self._last_directional_orphan_resolve_check < max(1.0, OFFICIAL_RETRY_INTERVAL_SECS):
+            return
+        self._directional_orphan_resolve_inflight = True
+        task = asyncio.create_task(
+            self._resolve_closed_directional_orphans_bg(session, current_window_ts),
+            name="directional_orphan_resolve",
+        )
+        task.add_done_callback(self._on_bg_task_done)
 
     @staticmethod
     def _set_env_values(updates: dict[str, str]) -> None:
@@ -775,9 +1163,12 @@ class Bot:
         if not self._apply_safety_gate("startup_safety_block"):
             return
 
+        session = await self.get_session()
+        self._save(force=True)
         await self._ws_feed.start()
         for task in self._ws_feed._tasks:
             task.add_done_callback(self._on_bg_task_done)
+        self._schedule_live_account_refresh(session, force=True)
         if config.TG_TOKEN and config.TG_CHAT:
             self._telegram_task = asyncio.create_task(self._telegram_command_loop())
             self._telegram_task.add_done_callback(self._on_bg_task_done)
@@ -795,6 +1186,8 @@ class Bot:
                     self.state.trading_enabled = False
                     self.state.status = self.state.bot_status = "waiting"
                     self._sync_stats()
+                    session = await self.get_session()
+                    self._schedule_live_account_refresh(session)
                     self._save()
                     await asyncio.sleep(1.0)
                     continue
@@ -805,6 +1198,11 @@ class Bot:
 
                 self.state.trading_enabled = True
                 self._sync_stats()
+                cfg = self._load_cfg()
+                session = await self.get_session()
+                if await self._apply_live_balance_gate(session, cfg):
+                    await asyncio.sleep(5.0)
+                    continue
                 if not self._apply_safety_gate("runtime_safety_block"):
                     await asyncio.sleep(1.0)
                     continue
@@ -833,7 +1231,7 @@ class Bot:
         self._sync_stats()
         self._save(force=True)
 
-        await self._resolve_closed_directional_orphans(session, window_ts)
+        self._schedule_closed_directional_orphans(session, window_ts)
 
         health = await mkt.check_api_health(session)
         if health.get("maintenance"):
@@ -843,15 +1241,25 @@ class Bot:
             await self._sleep_until(close_ts + 5)
             return
 
-        market = await mkt.fetch_market(session, "BTC", interval_secs=market_interval)
+        market = await self._fetch_current_market_once(
+            session,
+            market_interval,
+            timeout=MARKET_DISCOVERY_ATTEMPT_TIMEOUT_SECS,
+        )
         if market is None:
-            log.warning("Market not found, skip window.")
-            self.state.status = self.state.bot_status = "idle"
-            self._save(force=True)
-            await self._sleep_until(close_ts + 5)
-            return
+            market = await self._watch_window_without_market(session, window_ts, close_ts, market_interval)
+            if market is None:
+                log.warning("Market not found before window close, skip window.")
+                self.state.status = self.state.bot_status = "idle"
+                self._save(force=True)
+                await self._sleep_until(close_ts + 5)
+                return
 
         set_clob_tokens(market.up_token, market.down_token)
+        self._target_locked_official = False
+        self._last_target_resync = 0.0
+        self._target_resync_task = None
+        self._pending_official_target = None
         btc_open, source = await self._btc_open(session, market, window_ts)
         if btc_open <= 0:
             log.warning("%s for %s, skip trades: delta rules require a valid target.", source, market.slug)
@@ -868,6 +1276,8 @@ class Bot:
         # btc_open sudah berasal dari priceToBeat resmi Polymarket.
         self._target_locked_official = source.startswith("Polymarket priceToBeat")
         self._last_target_resync = 0.0
+        self._target_resync_task = None
+        self._pending_official_target = None
         log.info(
             "Window %d | closes %s UTC | btc_open=$%.2f (%s) | balance=$%.2f",
             window_ts,
@@ -888,7 +1298,7 @@ class Bot:
             if secs_left <= 0:
                 break
 
-            await self._resolve_closed_directional_orphans(session, window_ts)
+            self._schedule_closed_directional_orphans(session, window_ts)
             if self._apply_daily_profit_halt(cfg):
                 break
             if not st.get_trading_enabled():
@@ -897,12 +1307,21 @@ class Bot:
                 self._sync_stats()
                 self._save(force=True)
                 break
+            data_started = time.perf_counter()
             btc_now = await self._btc_now(session)
-            market = await self._refresh_market(session, market, secs_left)
+            entry_scan_due = self._entry_scan_due(cfg, strategy_cfg, secs_left)
+            needs_orderbook_network = entry_scan_due or bool(getattr(self.state, "has_open_position", False))
+            market = await self._refresh_market(
+                session,
+                market,
+                secs_left,
+                allow_network=needs_orderbook_network,
+            )
             # FIX #2: adopsi priceToBeat resmi begitu terbit; kunci btc_open.
             btc_open, market = await self._resync_official_target(
                 session, market, window_ts, market_interval, btc_open
             )
+            data_latency_ms = round((time.perf_counter() - data_started) * 1000.0, 1)
             self.state.btc_open = btc_open
             target_unconfirmed = not self._target_locked_official
             delta = (
@@ -919,6 +1338,7 @@ class Bot:
             self.state.secs_elapsed = secs_elapsed
             self.state.btc_price = btc_now
             self.state.btc_distance = delta
+            self.state.latency_ms = data_latency_ms
             self.state.up_price = market.up_price
             self.state.down_price = market.down_price
             self.state.up_ask = market.up_ask
@@ -936,6 +1356,7 @@ class Bot:
             self.state.trading_enabled = st.get_trading_enabled()
             self.state.trades_this_window = trades_this_window
             self._update_open_legs()
+            self._schedule_live_account_refresh(session)
 
             if now - self._last_snapshot >= SNAPSHOT_INTERVAL:
                 self._last_snapshot = now
@@ -977,21 +1398,26 @@ class Bot:
                     # dan harga dekat strike — arah UP/DOWN belum bisa dipercaya.
                     # Tahan entry baru (exit di atas tetap jalan).
                     self.state.status = self.state.bot_status = "target_unconfirmed"
-                    if int(now) % 5 == 0:
+                    if now - getattr(self, "_last_target_unconfirmed_log", 0.0) >= 5.0:
+                        self._last_target_unconfirmed_log = now
                         log.warning(
                             "[FIX#2] entry ditahan: priceToBeat resmi belum konfirmasi "
                             "& near-strike (delta=$%.2f <= $%.2f)",
                             abs(delta), TARGET_NEAR_STRIKE_USD,
                         )
                     records = []
+                elif not entry_scan_due:
+                    self.state.status = self.state.bot_status = "watching"
+                    records = []
                 else:
+                    strategy_bankroll = st.get_balance() if config.MOCK_MODE else float(self.state.live_cash or 0.0)
                     records = await end_window.try_all_end_window(
                         market=market,
                         btc_open=btc_open,
                         btc_now=btc_now,
                         secs_elapsed=secs_elapsed,
                         secs_left=secs_left,
-                        bankroll_usd=st.get_balance(),
+                        bankroll_usd=strategy_bankroll,
                         session=session,
                         cfg=strategy_cfg,
                         settings=cfg,
@@ -1018,7 +1444,6 @@ class Bot:
                     )
 
             elapsed = time.perf_counter() - tick_started
-            self.state.latency_ms = round(elapsed * 1000.0, 1)
             self._save()
             await asyncio.sleep(max(0.0, TICK_INTERVAL - elapsed))
 
@@ -1028,6 +1453,7 @@ class Bot:
         self.state.status = self.state.bot_status = "idle"
         self._window_settings = None
         self._sync_stats()
+        await self._refresh_live_account(session, force=True)
         self._save(force=True)
         await self._sleep_until(close_ts + 5)
 

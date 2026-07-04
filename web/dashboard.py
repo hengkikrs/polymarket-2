@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
 from pathlib import Path
 
 from aiohttp import web
@@ -50,6 +49,27 @@ def _strategy_label() -> str:
 
 def _configured_mock_mode() -> bool:
     return str(os.getenv("MOCK_MODE", "true" if config.MOCK_MODE else "false")).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _mode_trades(trades: list[dict], mock_mode: bool) -> list[dict]:
+    return [trade for trade in trades if bool(trade.get("mock", True)) is mock_mode]
+
+
+def _stats_from_trades(trades: list[dict]) -> dict:
+    resolved = [trade for trade in trades if trade.get("resolved")]
+    wins = sum(1 for trade in resolved if trade.get("won") is True)
+    losses = sum(1 for trade in resolved if trade.get("won") is False)
+    counted = wins + losses
+    total_pnl = round(sum(float(trade.get("pnl") or 0.0) for trade in resolved), 4)
+    return {
+        "trades_total": len(trades),
+        "resolved": len(resolved),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": wins / counted * 100 if counted else 0.0,
+        "total_pnl": total_pnl,
+        "total_wagered": round(sum(float(trade.get("amount_usd") or 0.0) for trade in trades), 4),
+    }
 
 
 def _public_polymarket_account() -> str:
@@ -127,9 +147,10 @@ def _trade_calendar_ts(trade: dict) -> float:
 
 
 def _build_pnl_calendar(trades: list[dict], year: int | None = None, month: int | None = None) -> dict:
-    now = datetime.fromtimestamp(time.time())
-    year = int(year or now.year)
-    month = int(month or now.month)
+    today_key = st._daily_date(time.time())
+    today_year, today_month, _today_day = today_key.split("-", 2)
+    year = int(year or today_year)
+    month = int(month or today_month)
     if year < 1970 or year > 2100 or month < 1 or month > 12:
         raise ValueError("invalid calendar month")
 
@@ -140,10 +161,10 @@ def _build_pnl_calendar(trades: list[dict], year: int | None = None, month: int 
         ts = _trade_calendar_ts(trade)
         if ts <= 0:
             continue
-        dt = datetime.fromtimestamp(ts)
-        if dt.year != year or dt.month != month:
+        key = st._daily_date(ts)
+        trade_year, trade_month, _trade_day = key.split("-", 2)
+        if int(trade_year) != year or int(trade_month) != month:
             continue
-        key = dt.strftime("%Y-%m-%d")
         bucket = days.setdefault(
             key,
             {"date": key, "pnl": 0.0, "trade_count": 0, "wins": 0, "losses": 0},
@@ -180,7 +201,6 @@ def _build_pnl_calendar(trades: list[dict], year: int | None = None, month: int 
     trading_days = sum(1 for day in days.values() if int(day["trade_count"]) > 0)
     winning_days = sum(1 for day in days.values() if float(day["pnl"]) > 0)
     losing_days = sum(1 for day in days.values() if float(day["pnl"]) < 0)
-    today_key = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
     return {
         "year": year,
         "month": month,
@@ -264,7 +284,25 @@ def _trade_fire_layer(trade: dict) -> str:
     return "N/A"
 
 
-def _pnl_summary(trades: list[dict], stats: dict, balance: dict) -> dict:
+def _pnl_summary(trades: list[dict], stats: dict, balance: dict, state: dict, *, mock_mode: bool) -> dict:
+    total_capital = float(os.getenv("DASHBOARD_TOTAL_CAPITAL_USD", "1000.0"))
+    if not mock_mode:
+        live_cash = float(state.get("live_cash", 0.0) or 0.0)
+        live_portfolio = float(state.get("live_portfolio", 0.0) or 0.0)
+        live_total = float(state.get("live_total", 0.0) or 0.0) or round(live_cash + live_portfolio, 4)
+        live_ok = bool(state.get("live_balance_ok", False)) and bool(state.get("live_portfolio_ok", False))
+        return {
+            "source": "live_account" if live_ok else "live_unavailable",
+            "live_ok": live_ok,
+            "total_pnl": stats["total_pnl"],
+            "win_rate": stats["win_rate"],
+            "total_trades": stats["trades_total"],
+            "avg_entry": 0.0,
+            "max_drawdown": 0.0,
+            "current_capital": live_total if live_ok else None,
+            "live_cash": live_cash if live_ok else None,
+            "live_portfolio": live_portfolio if live_ok else None,
+        }
     entries = [float(t.get("entry_price") or 0.0) for t in trades if float(t.get("entry_price") or 0.0) > 0]
     avg_entry = round(sum(entries) / len(entries), 4) if entries else 0.0
     equity = 0.0
@@ -277,6 +315,8 @@ def _pnl_summary(trades: list[dict], stats: dict, balance: dict) -> dict:
         peak = max(peak, equity)
         max_drawdown = min(max_drawdown, equity - peak)
     return {
+        "source": "mock_ledger",
+        "live_ok": False,
         "total_pnl": stats["total_pnl"],
         "win_rate": stats["win_rate"],
         "total_trades": stats["trades_total"],
@@ -284,7 +324,7 @@ def _pnl_summary(trades: list[dict], stats: dict, balance: dict) -> dict:
         "max_drawdown": round(max_drawdown, 4),
         "current_capital": float(balance.get("balance", 0.0) or 0.0),
         "initial_capital": float(balance.get("initial", 0.0) or 0.0),
-        "total_capital": float(os.getenv("DASHBOARD_TOTAL_CAPITAL_USD", "1000.0")),
+        "total_capital": total_capital,
     }
 
 
@@ -595,10 +635,24 @@ def _state_payload() -> dict:
         getattr(active_settings, key) != getattr(saved_settings, key)
         for key in strategy_keys
     )
-    trades = st.load_trades()
+    active_mock_mode = _configured_mock_mode()
+    all_trades = st.load_trades()
+    trades = _mode_trades(all_trades, active_mock_mode)
     bal = st.load_balance()
-    stats = st.calc_stats(trades)
+    stats = _stats_from_trades(trades)
     pnl_calendar = _build_pnl_calendar(trades)
+    display_daily_pnl = float(daily.get("pnl", 0.0) or 0.0) if active_mock_mode else float(pnl_calendar["today"]["pnl"])
+    display_daily_trades = int(daily.get("trades", 0) or 0) if active_mock_mode else int(pnl_calendar["today"]["trade_count"])
+    display_daily_wins = int(daily.get("wins", 0) or 0) if active_mock_mode else int(pnl_calendar["today"]["wins"])
+    display_daily_losses = int(daily.get("losses", 0) or 0) if active_mock_mode else int(pnl_calendar["today"]["losses"])
+    daily_profit_stop_usd = float(getattr(saved_settings, "daily_profit_stop_usd", 0.0) or 0.0)
+    display_daily_halted = bool(daily.get("halted", False)) if active_mock_mode else (
+        daily_profit_stop_usd > 0 and display_daily_pnl >= daily_profit_stop_usd
+    )
+    display_daily_halt_reason = str(daily.get("halt_reason", "") or "") if active_mock_mode else (
+        f"Daily profit target reached: ${display_daily_pnl:.2f} >= ${daily_profit_stop_usd:.2f}"
+        if display_daily_halted else ""
+    )
     low_price_winner_stats = _low_price_winner_stats(trades)
     low_price_winner_stats["recent"] = low_price_winner_stats.get("recent", [])[:STATE_RESEARCH_LIMIT]
     state.update({
@@ -613,15 +667,15 @@ def _state_payload() -> dict:
         "losses": stats["losses"],
         "low_price_winner_stats": low_price_winner_stats,
         "total_pnl": stats["total_pnl"],
-        "daily_pnl": float(daily.get("pnl", 0.0) or 0.0),
-        "daily_trades": int(daily.get("trades", 0) or 0),
-        "daily_wins": int(daily.get("wins", 0) or 0),
-        "daily_losses": int(daily.get("losses", 0) or 0),
-        "daily_halted": bool(daily.get("halted", False)),
-        "daily_halt_reason": str(daily.get("halt_reason", "") or ""),
+        "daily_pnl": display_daily_pnl,
+        "daily_trades": display_daily_trades,
+        "daily_wins": display_daily_wins,
+        "daily_losses": display_daily_losses,
+        "daily_halted": display_daily_halted,
+        "daily_halt_reason": display_daily_halt_reason,
         "daily_start_balance": float(daily.get("start_balance", 0.0) or 0.0),
-        "daily_profit_stop_usd": float(getattr(saved_settings, "daily_profit_stop_usd", 0.0) or 0.0),
-        "daily_profit_stop_amount": float(getattr(saved_settings, "daily_profit_stop_usd", 0.0) or 0.0),
+        "daily_profit_stop_usd": daily_profit_stop_usd,
+        "daily_profit_stop_amount": daily_profit_stop_usd,
         "win_rate": stats["win_rate"],
         "recent_trades": _recent_trades(
             trades,
@@ -632,10 +686,10 @@ def _state_payload() -> dict:
         "end_window_settings": _end_window_settings(active_settings),
         "saved_end_window_rules": _end_window_rules(saved_settings),
         "saved_end_window_settings": _end_window_settings(saved_settings),
-        "pnl_summary": _pnl_summary(trades, stats, bal),
+        "pnl_summary": _pnl_summary(trades, stats, bal, state, mock_mode=active_mock_mode),
         "pnl_history": _pnl_history(trades, limit=STATE_PNL_HISTORY_LIMIT),
         "pnl_calendar": pnl_calendar,
-        "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode": active_mock_mode,
         "mock_mode_configured": _configured_mock_mode(),
         "polymarket_account": _public_polymarket_account(),
         "trading_enabled": st.get_trading_enabled(),
@@ -647,7 +701,7 @@ def _state_payload() -> dict:
     current_slug = f"btc-updown-5m-{current_window}" if current_window > 0 else ""
     state["market_slug"] = current_slug
     state["market_url"] = f"https://polymarket.com/event/{current_slug}" if current_slug else ""
-    if config.MOCK_MODE:
+    if active_mock_mode:
         ledger = st.calc_trade_ledger_balance(trades, bal)
         state.update({
             "ledger_balance": ledger["ledger_balance"],
@@ -1119,7 +1173,10 @@ function deriveDecision(s){
  const maxLatencyMs=10.0;
  const stateFresh=age!==null&&age<=15;
  const running=!!s.trading_enabled&&!s.emergency_stop&&stateFresh;
- const balanceOk=tradeUsd<=0||Number(s.balance||0)>=tradeUsd;
+ const liveMode=s.mock_mode===false||s.mock_mode_configured===false;
+ const executionCash=liveMode?Number(s.live_cash||0):Number(s.balance||0);
+ const liveBalanceReason=/insufficient live balance/i.test(String(s.circuit_breaker_reason||''))||String(s.status||s.bot_status||'')==='insufficient_balance';
+ const balanceOk=tradeUsd<=0||executionCash>=tradeUsd;
  const windowCapOk=Number(s.trades_this_window||0)<Number(ew.max_trades_per_window||s.max_trades_per_window||1);
  const riskOk=!s.circuit_breaker_active&&!s.daily_halted;
  const chainlinkFresh=chainlinkAge===null||chainlinkAge<=maxFeedAge;
@@ -1154,13 +1211,14 @@ function deriveDecision(s){
   const candidates=quotes.filter(row=>row.side===side&&row.capacity+1e-9>=amount).sort((a,b)=>b.capacity-a.capacity);
   const candidate=candidates[0]||null;
   const scanning=enabled&&!used&&timeOk;
-  const ready=scanning&&deltaOkForTime&&!!candidate&&riskOk&&Number(s.balance||0)>=amount&&windowCapOk;
+  const ready=scanning&&deltaOkForTime&&!!candidate&&riskOk&&executionCash>=amount&&windowCapOk;
   return {index,label:`TIME-${index}`,enabled,used,timeOk,price,amount,minDelta,deltaOkForTime,quotes,candidates,candidate,scanning,ready};
  }).sort((a,b)=>a.price-b.price||a.index-b.index);
  const readyTime=timeStates.find(row=>row.ready)||null;
  const scanningTime=timeStates.find(row=>row.scanning)||null;
   let decision='WAIT', reason='Outside end-window', action='No order will be placed';
   if(!running){decision='WAIT';reason=s.emergency_stop?'Emergency stop active':(!stateFresh&&s.trading_enabled?'Bot state stale':'Bot stopped');}
+  else if(liveBalanceReason){decision='NO_TRADE';reason=String(s.circuit_breaker_reason||'Insufficient live balance');}
   else if(readyTime){
   decision=`BUY ${readyTime.label} ${readyTime.candidate.side}`;
   reason=`${readyTime.candidate.side} ask reached exactly ${num(readyTime.candidate.ask,2)} with ${money(readyTime.candidate.capacity)} liquidity`;
@@ -1172,7 +1230,7 @@ function deriveDecision(s){
  else if(!riskOk){decision='NO_TRADE';reason=s.daily_halted?(s.daily_halt_reason||'Daily halt active'):'Circuit breaker active';}
  else if(!windowCapOk){decision='NO_TRADE';reason='Max trades per window reached';}
  else if(!layerSlotOk){decision='NO_TRADE';reason='T1-T6 slot already used in this window';}
- else if(!balanceOk){decision='NO_TRADE';reason='Balance below trade size';}
+ else if(!balanceOk){decision='NO_TRADE';reason=liveMode?'Live cash below trade size':'Balance below trade size';}
  else if(chainlinkAge!==null&&!chainlinkFresh){decision='NO_TRADE';reason='Chainlink stale';}
  else if(!exchangeFresh){decision='NO_TRADE';reason='Exchange price stale';}
  else if(!latencyOk){decision='NO_TRADE';reason='Latency too high';}
@@ -1185,7 +1243,7 @@ function deriveDecision(s){
  else {decision=side==='DOWN'?'BUY_DOWN':'BUY_UP';reason=`${side} delta valid, price sane, data fresh, spread safe`;action=`Place ${decision} order`;}
  if(decision==='WAIT'&&secs>maxLayerSeconds&&next){action='No order will be placed';}
  if(decision==='NO_TRADE')action='No order will be placed';
- return {rules,ew,secs,delta,absDelta,side,upAsk,downAsk,upBid,downBid,upDepth,downDepth,activeAsk,oppositeAsk,activeSpread,maxSpread,tradeUsd,active,next,layer,required,minPrice,maxPrice,maxLayerSeconds,sideEdge,age,stateFresh,priceSource,chainlinkAge,exchangeAge,clobAge,latencyMs,maxFeedAge,maxLatencyMs,running,balanceOk,windowCapOk,layerSlotOk,riskOk,chainlinkFresh,exchangeFresh,latencyOk,clobOk,spreadOk,priceOk,sidePriceOk,deltaOk,orderbookOk,activeCapacity,saturated,openLegs,timeStates,readyTime,scanningTime,decision,reason,action};
+ return {rules,ew,secs,delta,absDelta,side,upAsk,downAsk,upBid,downBid,upDepth,downDepth,activeAsk,oppositeAsk,activeSpread,maxSpread,tradeUsd,active,next,layer,required,minPrice,maxPrice,maxLayerSeconds,sideEdge,age,stateFresh,priceSource,chainlinkAge,exchangeAge,clobAge,latencyMs,maxFeedAge,maxLatencyMs,running,liveMode,executionCash,liveBalanceReason,balanceOk,windowCapOk,layerSlotOk,riskOk,chainlinkFresh,exchangeFresh,latencyOk,clobOk,spreadOk,priceOk,sidePriceOk,deltaOk,orderbookOk,activeCapacity,saturated,openLegs,timeStates,readyTime,scanningTime,decision,reason,action};
 }
 
 function renderDecision(s,d){
@@ -1353,6 +1411,7 @@ function setPage(kind,page){
 function renderChecklist(s,d){
  const checks=[
   ['Market open', d.secs>4, d.secs<=0?'warn':null],
+  [d.liveMode?'Live cash enough':'Balance enough', d.balanceOk],
   ['Token UP/DOWN valid', (d.upAsk>0||d.upBid>0)&&(d.downAsk>0||d.downBid>0)],
   ['Chainlink fresh', d.chainlinkAge===null?null:d.chainlinkFresh],
   ['Exchange price fresh', d.exchangeFresh],
@@ -1546,11 +1605,22 @@ function renderPnlCharts(s){
 
 function renderPnlSummary(s){
  const p=s.pnl_summary||{};
- const totalPnl = p.total_pnl ?? s.total_pnl ?? 0;
+ const modeIsLive = s.mock_mode_configured===false || s.mock_mode===false;
+ const source = p.source || (modeIsLive ? 'live_unavailable' : 'mock_ledger');
+ const liveOk = source==='live_account';
+ const totalPnl = p.total_pnl ?? (modeIsLive ? null : (s.total_pnl ?? 0));
  const totalCap = p.total_capital || 1000;
- const profitPct = totalCap > 0 ? (totalPnl / totalCap * 100) : 0;
- const currentModal = totalCap + totalPnl;
- const items=[
+ const profitPct = modeIsLive ? null : (totalPnl===null ? null : (totalCap > 0 ? (totalPnl / totalCap * 100) : 0));
+ const currentModal = p.current_capital ?? (totalPnl===null ? null : totalCap + totalPnl);
+ const items=modeIsLive?[
+  ['Source',liveOk?'Polymarket account':'Live unavailable',liveOk?'mono good':'mono warn'],
+  ['Account value',currentModal===null?'N/A':money(currentModal),'mono'],
+  ['Live cash',p.live_cash===null||p.live_cash===undefined?'N/A':money(p.live_cash),'mono'],
+  ['Open value',p.live_portfolio===null||p.live_portfolio===undefined?'N/A':money(p.live_portfolio),'mono'],
+  ['Live PnL',totalPnl===null?'N/A':money(totalPnl),'mono '+(totalPnl===null?'warn':clsBy(totalPnl))],
+  ['Today live PnL',money(s.daily_pnl),'mono '+clsBy(s.daily_pnl)],
+  ['Live trades',String(p.total_trades??s.trades_total??0),'mono'],
+ ]:[
   ['Modal saat ini',money(currentModal),'mono'],
   ['Total modal',money(totalCap),'mono'],
   ['Total PnL',money(totalPnl),'mono '+clsBy(totalPnl)],
@@ -1562,7 +1632,7 @@ function renderPnlSummary(s){
   ['Max drawdown',money(p.max_drawdown),'mono bad'],
  ];
  $('pnlSummary').innerHTML=items.map(([label,value,klass])=>`<div class="metric"><div class="label">${esc(label)}</div><div class="value ${klass}">${esc(value)}</div></div>`).join('');
- setBadge('pnlMode', s.mock_mode?'MOCK':'LIVE', s.mock_mode?'mock':'live');
+ setBadge('pnlMode', modeIsLive?'LIVE':'MOCK', modeIsLive?'live':'mock');
 }
 
 function renderState(s){
@@ -1659,8 +1729,9 @@ async def api_state(_request: web.Request) -> web.Response:
 async def api_pnl_calendar(request: web.Request) -> web.Response:
     year = request.rel_url.query.get("year")
     month = request.rel_url.query.get("month")
+    trades = _mode_trades(st.load_trades(), _configured_mock_mode())
     data = _build_pnl_calendar(
-        st.load_trades(),
+        trades,
         int(year) if year else None,
         int(month) if month else None,
     )
@@ -1676,7 +1747,19 @@ async def api_control(request: web.Request) -> web.Response:
     if enabled:
         st.set_emergency_stop(False)
         state = st.load_state()
-        _sync_daily_state_fields(state, persist=True)
+        if _configured_mock_mode():
+            _sync_daily_state_fields(state, persist=True)
+        else:
+            state.update({
+                "daily_pnl": 0.0,
+                "daily_trades": 0,
+                "daily_wins": 0,
+                "daily_losses": 0,
+                "daily_halted": False,
+                "daily_halt_reason": "",
+            })
+            st._atomic_write(st.STATE_FILE, json.dumps(state, indent=2))
+            st._remember_json(st.STATE_FILE, state)
     return web.json_response({
         "success": True,
         "trading_enabled": enabled,
@@ -1688,7 +1771,7 @@ async def api_settings_get(_request: web.Request) -> web.Response:
     data = st.asdict(st.load_settings())
     data.update({
         "strategy_settings_effective": "next_window",
-        "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode": _configured_mock_mode(),
         "mock_mode_configured": _configured_mock_mode(),
         "polymarket_account": _public_polymarket_account(),
         "end_window_trade_usd": float(os.getenv("END_WINDOW_TRADE_USD", data.get("trade_amount", 0.0))),
@@ -1702,7 +1785,7 @@ async def api_health(_request: web.Request) -> web.Response:
     return web.json_response({
         "ok": True,
         "service": "poly-v3-dashboard",
-        "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode": _configured_mock_mode(),
         "mock_mode_configured": _configured_mock_mode(),
         "polymarket_account": _public_polymarket_account(),
         "trading_enabled": bool(st.get_trading_enabled()),
@@ -1755,7 +1838,7 @@ async def api_settings_post(request: web.Request) -> web.Response:
     st._atomic_write(st.STATE_FILE, json.dumps(state_data, indent=2))
     st._remember_json(st.STATE_FILE, state_data)
     settings.update({
-        "mock_mode": bool(config.MOCK_MODE),
+        "mock_mode": _configured_mock_mode(),
         "mock_mode_configured": _configured_mock_mode(),
         "polymarket_account": _public_polymarket_account(),
         "end_window_trade_usd": float(os.getenv("END_WINDOW_TRADE_USD", settings.get("trade_amount", 0.0))),

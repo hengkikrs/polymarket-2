@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,6 +17,7 @@ from web.dashboard import (
     _trade_fire_layer,
     api_control,
     api_health,
+    api_pnl_calendar,
     api_settings_post,
     index,
 )
@@ -24,6 +25,18 @@ from web.dashboard import (
 
 def _ts(year: int, month: int, day: int, hour: int = 12) -> float:
     return datetime(year, month, day, hour, 0, 0).timestamp()
+
+
+def _utc_ts(year: int, month: int, day: int, hour: int = 12, minute: int = 0) -> float:
+    return datetime(year, month, day, hour, minute, 0, tzinfo=timezone.utc).timestamp()
+
+
+def _bangkok_date(ts: float | None = None) -> str:
+    if ts is None:
+        return "2026-06-28"
+    return datetime.fromtimestamp(ts, timezone.utc).astimezone(
+        timezone(timedelta(hours=7))
+    ).strftime("%Y-%m-%d")
 
 
 def _cell(calendar_data: dict, date_key: str) -> dict:
@@ -107,6 +120,30 @@ def test_pnl_calendar_includes_today_summary_for_share_card():
         "trade_count": 2,
         "wins": 1,
         "losses": 1,
+    }
+
+
+def test_pnl_calendar_uses_trading_timezone_for_day_boundary(monkeypatch):
+    monkeypatch.setenv("POLY_DAILY_TIMEZONE", "Asia/Bangkok")
+    trades = [
+        {"timestamp": _utc_ts(2026, 6, 27, 16, 30), "resolved": True, "won": True, "pnl": 99.0},
+        {"timestamp": _utc_ts(2026, 6, 27, 18, 30), "resolved": True, "won": True, "pnl": 2.0},
+    ]
+
+    with (
+        patch("web.dashboard.st._daily_date", side_effect=_bangkok_date),
+        patch("web.dashboard.time.time", return_value=_utc_ts(2026, 6, 27, 19, 0)),
+    ):
+        cal = _build_pnl_calendar(trades, 2026, 6)
+
+    assert _cell(cal, "2026-06-27")["pnl"] == 99.0
+    assert _cell(cal, "2026-06-28")["pnl"] == 2.0
+    assert cal["today"] == {
+        "date": "2026-06-28",
+        "pnl": 2.0,
+        "trade_count": 1,
+        "wins": 1,
+        "losses": 0,
     }
 
 
@@ -340,6 +377,105 @@ def test_settings_post_persists_mock_mode_to_env(tmp_path, monkeypatch):
     assert payload["restart_required"] is True
     assert payload["settings"]["mock_mode_configured"] is False
     assert "MOCK_MODE=false" in env_file.read_text(encoding="utf-8")
+
+
+def test_state_payload_switches_pnl_surfaces_to_live_mode(monkeypatch):
+    monkeypatch.setenv("MOCK_MODE", "false")
+    state = {
+        "current_window": 1800000000,
+        "seconds_left": 120.0,
+        "active_settings": st.asdict(st.BotSettings()),
+        "live_cash": 16.25,
+        "live_portfolio": 3.75,
+        "live_total": 20.0,
+        "live_balance_ok": True,
+        "live_portfolio_ok": True,
+    }
+    live_ts = _ts(2026, 6, 27)
+    trades = [
+        {"timestamp": live_ts, "resolved": True, "won": True, "pnl": 2.0, "amount_usd": 3.0, "mock": False},
+        {"timestamp": live_ts, "resolved": True, "won": True, "pnl": 999.0, "amount_usd": 100.0, "mock": True},
+    ]
+
+    with (
+        patch("web.dashboard.time.time", return_value=live_ts),
+        patch("web.dashboard.st.load_state", return_value=state),
+        patch("web.dashboard.st.load_daily_pnl", return_value={
+            "pnl": 999.0,
+            "trades": 1,
+            "wins": 1,
+            "losses": 0,
+            "halted": True,
+            "halt_reason": "mock daily halt",
+            "start_balance": 1000.0,
+        }),
+        patch("web.dashboard.st.load_settings", return_value=st.BotSettings()),
+        patch("web.dashboard.st.load_snapshots", return_value=[]),
+        patch("web.dashboard.st.load_trades", return_value=trades),
+        patch("web.dashboard.st.load_balance", return_value={"balance": 1000.0, "initial": 1000.0}),
+        patch("web.dashboard.st.get_trading_enabled", return_value=True),
+        patch("web.dashboard.st.get_emergency_stop", return_value=False),
+        patch("web.dashboard.st.load_price_extremes", return_value={}),
+    ):
+        payload = _state_payload()
+
+    assert payload["mock_mode"] is False
+    assert payload["pnl_summary"]["source"] == "live_account"
+    assert payload["pnl_summary"]["current_capital"] == 20.0
+    assert payload["pnl_summary"]["total_pnl"] == 2.0
+    assert "total_capital" not in payload["pnl_summary"]
+    assert payload["trades_total"] == 1
+    assert payload["total_pnl"] == 2.0
+    assert payload["daily_pnl"] == 2.0
+    assert payload["daily_halted"] is False
+    assert payload["daily_halt_reason"] == ""
+    assert payload["recent_trades"][0]["mock"] is False
+
+
+def test_pnl_calendar_endpoint_filters_to_configured_live_mode(monkeypatch):
+    monkeypatch.setenv("MOCK_MODE", "false")
+    live_ts = _ts(2026, 6, 27)
+    trades = [
+        {"timestamp": live_ts, "resolved": True, "won": True, "pnl": 2.0, "mock": False},
+        {"timestamp": live_ts, "resolved": True, "won": True, "pnl": 999.0, "mock": True},
+    ]
+    request = SimpleNamespace(rel_url=SimpleNamespace(query={"year": "2026", "month": "6"}))
+
+    with (
+        patch("web.dashboard.time.time", return_value=live_ts),
+        patch("web.dashboard.st.load_trades", return_value=trades),
+    ):
+        response = asyncio.run(api_pnl_calendar(request))
+
+    payload = json.loads(response.text)
+    assert payload["month_pnl"] == 2.0
+    assert payload["today"]["pnl"] == 2.0
+    assert payload["today"]["trade_count"] == 1
+
+
+def test_live_control_start_does_not_persist_mock_daily_halt(tmp_path, monkeypatch):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(st, "STATE_FILE", state_file)
+    monkeypatch.setenv("MOCK_MODE", "false")
+    st.save_state(st.BotState(daily_halted=True, daily_halt_reason="old mock halt"))
+
+    async def _json():
+        return {"trading_enabled": True}
+
+    request = SimpleNamespace(headers={}, rel_url=SimpleNamespace(query={}), json=_json)
+    with (
+        patch("web.dashboard.st.set_trading_enabled"),
+        patch("web.dashboard.st.set_emergency_stop"),
+        patch("web.dashboard._state_payload", return_value={"mock_mode": False}),
+    ):
+        response = asyncio.run(api_control(request))
+
+    payload = json.loads(response.text)
+    state_data = st.load_state()
+    assert payload["success"] is True
+    assert state_data["daily_halted"] is False
+    assert state_data["daily_halt_reason"] == ""
+    assert state_data["daily_pnl"] == 0.0
 
 
 def test_state_payload_uses_saved_daily_profit_stop_not_active_window():

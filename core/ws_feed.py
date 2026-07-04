@@ -53,6 +53,10 @@ def _env_int(name: str, default: int) -> int:
 # (mencegah age memanjat diam-diam saat socket half-open).
 WS_HEARTBEAT_SECS: float = _env_float("WS_HEARTBEAT_SECS", 10.0)
 WS_STALE_RECV_SECS: float = _env_float("WS_STALE_RECV_SECS", 6.0)
+CHAINLINK_WS_ENABLED: bool = os.getenv("CHAINLINK_WS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+COINBASE_WS_ENABLED: bool = os.getenv("COINBASE_WS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+GATEIO_WS_ENABLED: bool = os.getenv("GATEIO_WS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+BINANCE_WS_ENABLED: bool = os.getenv("BINANCE_WS_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
 async def _recv_or_stale(ws, stale_secs: float):
@@ -491,10 +495,10 @@ async def _clob_poller(cache: PriceCache, stop_event: asyncio.Event):
     """
     import aiohttp
 
-    target_rpm = max(60.0, _env_float("CLOB_POLL_TARGET_RPM", 1200.0))
-    min_sweep_interval = max(0.02, _env_float("CLOB_POLL_MIN_SWEEP_INTERVAL", 0.05))
+    target_rpm = max(60.0, _env_float("CLOB_POLL_TARGET_RPM", 240.0))
+    min_sweep_interval = max(0.02, _env_float("CLOB_POLL_MIN_SWEEP_INTERVAL", 0.50))
     max_concurrency = max(1, _env_int("CLOB_POLL_MAX_CONCURRENCY", 8))
-    book_timeout = max(0.05, _env_float("CLOB_BOOK_TIMEOUT_SECS", 0.15))
+    book_timeout = max(0.05, _env_float("CLOB_BOOK_TIMEOUT_SECS", 0.75))
     backoff_until = 0.0          # epoch seconds
     consecutive_errors = 0
     last_miss_log = 0.0
@@ -653,14 +657,23 @@ class WsFeed:
     async def start(self):
         """Mulai semua background WS tasks."""
         self._stop.clear()
-        self._tasks = [
-            asyncio.create_task(_ws_chainlink(self._cache, self._stop)),
-            asyncio.create_task(_ws_coinbase(self._cache, self._stop)),
-            asyncio.create_task(_ws_gateio(self._cache, self._stop)),
-            asyncio.create_task(_ws_binance(self._cache, self._stop)),
-            asyncio.create_task(_clob_poller(self._cache, self._stop)),
-        ]
-        log.info("WS feed started (Chainlink + Coinbase + Gate.io + Binance fallback + CLOB poller)")
+        self._tasks = []
+        feeds = []
+        if CHAINLINK_WS_ENABLED:
+            self._tasks.append(asyncio.create_task(_ws_chainlink(self._cache, self._stop)))
+            feeds.append("Chainlink")
+        if GATEIO_WS_ENABLED:
+            self._tasks.append(asyncio.create_task(_ws_gateio(self._cache, self._stop)))
+            feeds.append("Gate.io")
+        if BINANCE_WS_ENABLED:
+            self._tasks.append(asyncio.create_task(_ws_binance(self._cache, self._stop)))
+            feeds.append("Binance fallback")
+        self._tasks.append(asyncio.create_task(_clob_poller(self._cache, self._stop)))
+        feeds.append("CLOB poller")
+        if COINBASE_WS_ENABLED:
+            self._tasks.append(asyncio.create_task(_ws_coinbase(self._cache, self._stop)))
+            feeds.insert(1 if CHAINLINK_WS_ENABLED else 0, "Coinbase")
+        log.info("WS feed started (%s)", " + ".join(feeds))
 
     async def stop(self):
         """Stop semua tasks gracefully."""

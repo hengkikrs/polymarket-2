@@ -725,7 +725,10 @@ class BotState:
     live_portfolio: float = 0.0     # value of open positions (shares × price)
     live_total: float = 0.0         # cash + portfolio
     live_balance_ok: bool = False   # True if last fetch succeeded
+    live_balance_error: str = ""
+    live_balance_last_ok_ts: float = 0.0
     live_portfolio_ok: bool = False
+    live_portfolio_error: str = ""
     live_portfolio_source: str = ""
     ledger_balance: float = 0.0
     ledger_balance_drift: float = 0.0

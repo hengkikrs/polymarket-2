@@ -799,9 +799,9 @@ async def refresh_prices(session: aiohttp.ClientSession, mkt: BTCMarket) -> BTCM
 
     clob_url = get_active_clob_api()
     try:
-        book_timeout = max(0.05, float(os.getenv("CLOB_BOOK_TIMEOUT_SECS", "0.35")))
+        book_timeout = max(0.05, float(os.getenv("CLOB_BOOK_TIMEOUT_SECS", "0.75")))
     except ValueError:
-        book_timeout = 0.35
+        book_timeout = 0.75
     for label, token_id in [("up", mkt.up_token), ("down", mkt.down_token)]:
         if cached[label]:
             continue

@@ -21,7 +21,7 @@ from strategies import end_window
 
 log = logging.getLogger("end_window")
 _last_skip_log: dict[tuple[str, str], float] = {}
-DIRECT_BOOK_TIMEOUT_SECS = max(0.05, float(os.getenv("END_WINDOW_DIRECT_BOOK_TIMEOUT_SECS", "0.20")))
+DIRECT_BOOK_TIMEOUT_SECS = max(0.05, float(os.getenv("END_WINDOW_DIRECT_BOOK_TIMEOUT_SECS", "0.75")))
 DIRECT_BOOK_CACHE_MAX_AGE_SECS = max(0.05, float(os.getenv("END_WINDOW_DIRECT_BOOK_CACHE_MAX_AGE_SECS", "1.0")))
 TIME_MIN_DELTA_USD = 3.0
 TIME_DEFAULT_PRICES = {1: 0.98, 2: 0.99, 3: 0.97, 4: 0.96, 5: 0.95, 6: 0.94}

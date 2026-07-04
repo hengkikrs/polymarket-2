@@ -26,6 +26,7 @@ def test_live_buy_uses_dollar_market_order_path():
         patch.object(trader.config, "MOCK_MODE", False),
         patch.object(trader, "HAS_SDK", True),
         patch.object(trader, "_get_clob_client", return_value=object()),
+        patch.object(trader, "fetch_live_balance", AsyncMock(return_value={"ok": True, "cash": 10.0})),
         patch.object(
             trader,
             "_get_market_info",
@@ -55,6 +56,7 @@ def test_live_market_buy_is_not_blocked_by_limit_order_share_minimum():
         patch.object(trader.config, "MOCK_MODE", False),
         patch.object(trader, "HAS_SDK", True),
         patch.object(trader, "_get_clob_client", return_value=object()),
+        patch.object(trader, "fetch_live_balance", AsyncMock(return_value={"ok": True, "cash": 10.0})),
         patch.object(
             trader,
             "_get_market_info",
@@ -75,6 +77,79 @@ def test_live_market_buy_is_not_blocked_by_limit_order_share_minimum():
 
     assert out is result
     buy.assert_awaited_once()
+
+
+def test_live_buy_stops_before_order_when_cash_is_too_low():
+    with (
+        patch.object(trader.config, "MOCK_MODE", False),
+        patch.object(trader, "HAS_SDK", True),
+        patch.object(trader, "_get_clob_client", return_value=object()) as client,
+        patch.object(trader, "fetch_live_balance", AsyncMock(return_value={"ok": True, "cash": 0.29})),
+        patch.object(trader, "_get_market_info", AsyncMock()) as market_info,
+        patch.object(trader, "_buy_sdk_fok", AsyncMock()) as buy,
+    ):
+        out = asyncio.run(
+            trader.execute_buy(
+                "token-up",
+                "UP",
+                0.99,
+                10.0,
+                "condition",
+                allow_partial=False,
+            )
+        )
+
+    assert out.success is False
+    assert "insufficient live balance" in out.error
+    assert out.fill_status == "insufficient_balance"
+    client.assert_called_once()
+    market_info.assert_not_awaited()
+    buy.assert_not_awaited()
+
+
+def test_live_buy_stops_when_balance_is_unavailable():
+    with (
+        patch.object(trader.config, "MOCK_MODE", False),
+        patch.object(trader, "HAS_SDK", True),
+        patch.object(trader, "_get_clob_client", return_value=object()) as client,
+        patch.object(trader, "fetch_live_balance", AsyncMock(return_value={"ok": False, "cash": 6.2, "error": "timeout"})),
+        patch.object(trader, "_get_market_info", AsyncMock()) as market_info,
+        patch.object(trader, "_buy_sdk_fok", AsyncMock()) as buy,
+    ):
+        out = asyncio.run(
+            trader.execute_buy(
+                "token-up",
+                "UP",
+                0.99,
+                5.0,
+                "condition",
+                allow_partial=False,
+            )
+        )
+
+    assert out.success is False
+    assert "live balance unavailable: timeout" in out.error
+    assert out.fill_status == "balance_unavailable"
+    client.assert_called_once()
+    market_info.assert_not_awaited()
+    buy.assert_not_awaited()
+
+
+def test_live_balance_fetch_error_preserves_last_cash():
+    client = SimpleNamespace(get_balance_allowance=Mock(side_effect=OSError("connection refused")))
+    cache = {"cash": 6.2, "ts": 0.0, "ok": True, "error": "", "last_ok_ts": 50.0}
+
+    with (
+        patch.object(trader, "_live_bal_cache", cache),
+        patch.object(trader, "HAS_SDK", True),
+        patch.object(trader, "_get_clob_client", return_value=client),
+    ):
+        out = asyncio.run(trader.fetch_live_balance(None))
+
+    assert out["ok"] is False
+    assert out["cash"] == 6.2
+    assert "connection refused" in out["error"]
+    assert out["last_ok_ts"] == 50.0
 
 
 def test_live_buy_builds_market_order_with_dollar_amount_and_price_cap():

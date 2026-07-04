@@ -591,6 +591,22 @@ async def execute_buy(
     if not client:
         return TradeResult(success=False, error="V2 ClobClient gagal init")
 
+    live_balance = await fetch_live_balance(None)
+    if not live_balance.get("ok"):
+        err = str(live_balance.get("error") or "balance fetch failed")
+        return TradeResult(
+            success=False,
+            error=f"live balance unavailable: {err}",
+            fill_status="balance_unavailable",
+        )
+    live_cash = float(live_balance.get("cash", 0.0) or 0.0)
+    if live_balance.get("ok") and live_cash + 1e-9 < float(amount):
+        return TradeResult(
+            success=False,
+            error=f"insufficient live balance: cash ${live_cash:.2f} < order ${float(amount):.2f}",
+            fill_status="insufficient_balance",
+        )
+
     info = await _get_market_info(client, token_id)
     tick_size = info["tick_size"]
 
@@ -1058,7 +1074,13 @@ def _parse_sdk_resp(resp, price: float, size: float, outcome: str) -> TradeResul
 #  LIVE BALANCE FETCH — V2 pUSD via SDK
 # ─────────────────────────────────────────────────────────────────────────────
 
-_live_bal_cache: dict = {"cash": 0.0, "ts": 0.0, "ok": False, "error": ""}
+_live_bal_cache: dict = {
+    "cash": 0.0,
+    "ts": 0.0,
+    "ok": False,
+    "error": "",
+    "last_ok_ts": 0.0,
+}
 _live_portfolio_cache: dict = {
     "portfolio": 0.0,
     "ts": 0.0,
@@ -1078,6 +1100,18 @@ def invalidate_live_balance_cache():
     _live_portfolio_cache["ts"] = 0.0
 
 
+def _cache_live_balance_error(error: str) -> dict:
+    global _live_bal_cache
+    _live_bal_cache = {
+        "cash": float(_live_bal_cache.get("cash", 0.0) or 0.0),
+        "ts": time.time(),
+        "ok": False,
+        "error": str(error or "balance fetch failed"),
+        "last_ok_ts": float(_live_bal_cache.get("last_ok_ts", 0.0) or 0.0),
+    }
+    return _live_bal_cache
+
+
 async def fetch_live_balance(session: aiohttp.ClientSession) -> dict:
     """Fetch real pUSD balance dari V2 via SDK.
     NOTE: V2 collateral = pUSD. User harus wrap USDC.e → pUSD via
@@ -1089,15 +1123,11 @@ async def fetch_live_balance(session: aiohttp.ClientSession) -> dict:
         return _live_bal_cache
 
     if not HAS_SDK:
-        _live_bal_cache = {"cash": 0.0, "ts": time.time(),
-                           "ok": False, "error": "no V2 SDK"}
-        return _live_bal_cache
+        return _cache_live_balance_error("no V2 SDK")
 
     client = _get_clob_client()
     if not client:
-        _live_bal_cache = {"cash": 0.0, "ts": time.time(),
-                           "ok": False, "error": "V2 client init failed"}
-        return _live_bal_cache
+        return _cache_live_balance_error("V2 client init failed")
 
     try:
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -1114,15 +1144,19 @@ async def fetch_live_balance(session: aiohttp.ClientSession) -> dict:
         # approve → $1e71 nilai palsu kalau diambil duluan.
         raw = result.get("balance") or result.get("allowance") or "0"
         cash = float(raw) / 1e6   # pUSD = 6 decimals
-        _live_bal_cache = {"cash": round(cash, 2), "ts": time.time(),
-                           "ok": True, "error": ""}
+        now = time.time()
+        _live_bal_cache = {
+            "cash": round(cash, 2),
+            "ts": now,
+            "ok": True,
+            "error": "",
+            "last_ok_ts": now,
+        }
         return _live_bal_cache
     except asyncio.TimeoutError:
-        _live_bal_cache = {"cash": 0.0, "ts": time.time(),
-                           "ok": False, "error": "balance fetch timeout"}
+        _cache_live_balance_error("balance fetch timeout")
     except Exception as e:
-        _live_bal_cache = {"cash": 0.0, "ts": time.time(),
-                           "ok": False, "error": str(e)}
+        _cache_live_balance_error(str(e))
 
     return _live_bal_cache
 

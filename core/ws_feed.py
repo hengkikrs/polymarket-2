@@ -130,13 +130,13 @@ class PriceCache:
         if len(self._btc_history) > 600:
             self._btc_history = self._btc_history[-600:]
 
-    def set_source_btc(self, price: float, source: str) -> None:
+    def set_source_btc(self, price: float, source: str, timestamp: float | None = None) -> None:
         key = str(source or "").strip().lower()
         if key and float(price or 0.0) > 0:
-            timestamp = time.time()
-            self._btc_sources[key] = (float(price), timestamp)
+            sample_ts = float(timestamp or time.time())
+            self._btc_sources[key] = (float(price), sample_ts)
             history = self._btc_source_history.setdefault(key, [])
-            history.append((timestamp, float(price)))
+            history.append((sample_ts, float(price)))
             if len(history) > 600:
                 self._btc_source_history[key] = history[-600:]
 
@@ -350,25 +350,61 @@ async def _ws_coinbase(cache: PriceCache, stop_event: asyncio.Event):
         backoff = min(backoff * 2, 30)
 
 
-def _chainlink_price(message: dict) -> Optional[float]:
-    payload = message.get("payload") if isinstance(message, dict) else None
-    if not isinstance(payload, dict):
-        return None
-    symbol = str(payload.get("symbol") or "").lower()
-    if symbol and symbol != "btc/usd":
-        return None
-    values = payload.get("data")
-    if isinstance(values, list) and values:
-        latest = values[-1]
-        if isinstance(latest, dict):
-            values = latest.get("value")
-    else:
-        values = payload.get("value")
+def _normalize_chainlink_ts(value) -> Optional[float]:
     try:
-        price = float(values or 0.0)
+        ts = float(value or 0.0)
     except (TypeError, ValueError):
         return None
-    return price if price > 0 else None
+    if ts <= 0:
+        return None
+    if ts > 1_000_000_000_000:
+        ts /= 1000.0
+    return ts
+
+
+def _chainlink_samples(message: dict) -> list[tuple[float, float | None]]:
+    payload = message.get("payload") if isinstance(message, dict) else None
+    if not isinstance(payload, dict):
+        return []
+    symbol = str(payload.get("symbol") or "").lower()
+    if symbol and symbol != "btc/usd":
+        return []
+    values = payload.get("data")
+    samples: list[tuple[float, float | None]] = []
+    if isinstance(values, list) and values:
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            try:
+                price = float(item.get("value") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if price > 0:
+                samples.append((
+                    price,
+                    _normalize_chainlink_ts(item.get("timestamp") or item.get("ts")),
+                ))
+    else:
+        try:
+            price = float(payload.get("value") or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        if price > 0:
+            samples.append((
+                price,
+                _normalize_chainlink_ts(payload.get("timestamp") or payload.get("ts")),
+            ))
+    return samples
+
+
+def _chainlink_sample(message: dict) -> Optional[tuple[float, float | None]]:
+    samples = _chainlink_samples(message)
+    return samples[-1] if samples else None
+
+
+def _chainlink_price(message: dict) -> Optional[float]:
+    sample = _chainlink_sample(message)
+    return sample[0] if sample else None
 
 
 async def _ws_chainlink(cache: PriceCache, stop_event: asyncio.Event):
@@ -403,9 +439,9 @@ async def _ws_chainlink(cache: PriceCache, stop_event: asyncio.Event):
                             break
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
-                                price = _chainlink_price(json.loads(msg.data))
-                                if price:
-                                    cache.set_source_btc(price, "chainlink")
+                                samples = _chainlink_samples(json.loads(msg.data))
+                                for price, sample_ts in samples:
+                                    cache.set_source_btc(price, "chainlink", timestamp=sample_ts)
                             except (ValueError, TypeError):
                                 pass
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):

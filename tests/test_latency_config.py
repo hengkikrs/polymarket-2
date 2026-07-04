@@ -13,6 +13,42 @@ class LatencyConfigTests(unittest.TestCase):
         })
         self.assertEqual(price, 62_345.67)
 
+    def test_chainlink_sample_preserves_official_timestamp(self):
+        sample = ws_feed._chainlink_sample({
+            "payload": {
+                "symbol": "btc/usd",
+                "data": [
+                    {"timestamp": 1_800_000_000, "value": 62_300.0},
+                    {"timestamp": 1_800_000_001, "value": 62_345.67},
+                ],
+            },
+        })
+        self.assertEqual(sample, (62_345.67, 1_800_000_001.0))
+
+    def test_chainlink_samples_preserve_full_history_batch(self):
+        samples = ws_feed._chainlink_samples({
+            "payload": {
+                "data": [
+                    {"timestamp": 1_800_000_000_000, "value": 62_300.0},
+                    {"timestamp": 1_800_000_001_000, "value": 62_345.67},
+                ],
+            },
+        })
+
+        self.assertEqual(samples, [
+            (62_300.0, 1_800_000_000.0),
+            (62_345.67, 1_800_000_001.0),
+        ])
+
+    def test_source_btc_at_time_uses_feed_timestamp(self):
+        cache = ws_feed.PriceCache()
+        cache.set_source_btc(62_300.0, "chainlink", timestamp=1_800_000_000.0)
+        cache.set_source_btc(62_345.67, "chainlink", timestamp=1_800_000_003.0)
+
+        sample = cache.source_btc_at_time("chainlink", 1_800_000_000.0, max_drift=0.5)
+
+        self.assertEqual(sample, (62_300.0, 1_800_000_000.0, 0.0))
+
     def test_coinbase_price_extracts_btc_usd_ticker(self):
         price = ws_feed._coinbase_price({
             "channel": "ticker",
